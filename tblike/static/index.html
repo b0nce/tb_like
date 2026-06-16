@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tb_like — fast scalar viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+  <div id="loadbar" class="loadbar hidden"></div>
+  <header>
+    <h1>tb_like</h1>
+    <span class="tagline">columnar TensorBoard — built for many series &amp; many runs</span>
+    <span class="status" id="status">starting…</span>
+    <button id="refresh-btn" class="refresh-btn" title="Re-read selected runs from disk (pick up new events)">↻ Refresh selected</button>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <section>
+        <div class="sec-head">
+          <h2>Runs <span class="count" id="run-count"></span></h2>
+          <div class="row-actions">
+            <button id="runs-all">all</button>
+            <button id="runs-none">none</button>
+          </div>
+        </div>
+        <input type="search" id="run-filter" placeholder="filter runs…" />
+        <div class="list" id="run-list"><div class="placeholder">loading runs…</div></div>
+      </section>
+
+      <section>
+        <div class="sec-head">
+          <h2>Tags <span class="count" id="tag-count"></span></h2>
+          <div class="row-actions">
+            <button id="tags-expand">expand</button>
+            <button id="tags-collapse">collapse</button>
+            <button id="tags-clear">clear</button>
+          </div>
+        </div>
+        <input type="search" id="tag-filter" placeholder="filter tags — regex, e.g. loss/.*total|^lr" />
+        <div class="list tree" id="tag-list"></div>
+      </section>
+
+      <section class="controls">
+        <div id="pending" class="pending">no tags selected</div>
+        <label>max points/series
+          <input type="number" id="max-points" value="1500" min="50" max="20000" step="50" />
+        </label>
+        <label>x-axis
+          <select id="xaxis">
+            <option value="step">step</option>
+            <option value="wall_time">relative time</option>
+          </select>
+        </label>
+        <label class="chk"><input type="checkbox" id="smooth-on" /> smoothing <span id="smooth-val" class="qhead" style="margin-left:auto"><span>0.60</span></span></label>
+        <input type="range" id="smooth" min="0" max="0.99" step="0.01" value="0.6" />
+        <label class="chk"><input type="checkbox" id="logy" /> log y</label>
+        <label class="chk"><input type="checkbox" id="outliers-on" /> clip outliers (percentile)</label>
+        <div class="qgrid">
+          <div class="qcol">
+            <div class="qhead">min quantile <span id="q-low-val">1.0%</span></div>
+            <input type="range" id="q-low" min="0" max="0.2" step="0.005" value="0.01" />
+            <div class="qbounds"><span>0%</span><span>20%</span></div>
+          </div>
+          <div class="qcol">
+            <div class="qhead">max quantile <span id="q-high-val">99.0%</span></div>
+            <input type="range" id="q-high" min="0.8" max="1" step="0.005" value="0.99" />
+            <div class="qbounds"><span>80%</span><span>100%</span></div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <div id="divider" class="divider" title="drag to resize"></div>
+
+    <main id="charts">
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
