@@ -1,9 +1,9 @@
 [project]
 name = "tb-like"
-version = "0.1.0"
+version = "0.1.1"
 description = "A faster, columnar TensorBoard-style scalar viewer for many series and many runs."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Misha Kindulov", email = "kindulov.ml@gmail.com" }]
