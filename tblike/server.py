@@ -32,9 +32,10 @@ def create_app(
     cache_dir: str = "cache",
     watch: bool = True,
     interval: float = 10.0,
+    jobs: int = 1,
 ) -> FastAPI:
     store = Store(cache_dir)
-    watcher = Watcher(runs_dir, cache_dir, interval=interval)
+    watcher = Watcher(runs_dir, cache_dir, interval=interval, jobs=jobs)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -98,9 +99,11 @@ def create_app(
     return app
 
 
-# For `uvicorn tblike.server:app`
+# For `uvicorn tblike.server:app` (the CLI sets these env vars before launching).
 app = create_app(
     runs_dir=os.environ.get("TBLIKE_RUNS", "runs"),
     cache_dir=os.environ.get("TBLIKE_CACHE", "cache"),
     watch=os.environ.get("TBLIKE_WATCH", "1") != "0",
+    interval=float(os.environ.get("TBLIKE_INTERVAL", "10")),
+    jobs=int(os.environ.get("TBLIKE_JOBS", "1")),
 )

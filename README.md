@@ -33,7 +33,7 @@ uv tool install tb-like
 ## Quick start
 
 A "run" is a directory containing `events.out.tfevents.*` files. Point `tb_like`
-at a directory of runs:
+at a directory of runs and open the dashboard — that's it:
 
 ```
 my_runs/
@@ -42,19 +42,15 @@ my_runs/
   ...
 ```
 
-Convert and serve:
-
 ```bash
-# ingest one run -> cache/<run_id>/  (parallel parse + progress bar)
-tblike convert my_runs/run_a run_a
-
-# launch the dashboard + background watcher
-tblike serve --runs-dir my_runs --cache-dir cache --port 8000
+tblike my_runs --port 8000 --jobs 8
 # open http://127.0.0.1:8000
 ```
 
-The server's background watcher discovers runs under `--runs-dir`, converts any
-that changed, and serves them. You can also pre-convert everything with `tblike scan`.
+The background watcher discovers runs under the folder, converts any that
+changed to Parquet (parsing event files across `--jobs` worker processes), keeps
+the cache in sync, and serves them — no separate build step. The cache lives in
+`<runs_dir>/.tblike_cache` by default (override with `--cache-dir`).
 
 ## Dashboard features
 
@@ -69,10 +65,15 @@ that changed, and serves them. You can also pre-convert everything with `tblike 
 ## CLI
 
 ```
-tblike build-runs --source DATA --count N   # make N symlinked test runs from one
-tblike convert RUN_DIR [RUN_ID] [-j JOBS]   # ingest one run into Parquet
-tblike scan                                 # one incremental ingest pass over all runs
-tblike serve [--host H] [--port P]          # dashboard + background watcher
+tblike <runs_dir> [--port P] [--host H] [--cache-dir D] [-j JOBS] [--no-watch]
+                                            # the main command: serve + auto-ingest
+```
+
+Advanced / scriptable subcommands:
+
+```
+tblike convert RUN_DIR [RUN_ID] [-j JOBS]   # ingest one run into Parquet (one-off)
+tblike scan                                 # one incremental ingest pass, no server
 ```
 
 ## How it stores data

@@ -14,3 +14,4 @@ data/
 cache/
 runs/
 *.log
+.tblike_cache/

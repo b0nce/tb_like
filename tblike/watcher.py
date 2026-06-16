@@ -47,10 +47,11 @@ def _signature(run_dir: str) -> tuple[int, float]:
 
 
 class Watcher:
-    def __init__(self, runs_dir: str, cache_dir: str, interval: float = 10.0):
+    def __init__(self, runs_dir: str, cache_dir: str, interval: float = 10.0, jobs: int = 1):
         self.runs_dir = runs_dir
         self.cache_dir = cache_dir
         self.interval = interval
+        self.jobs = jobs
         self._sigs: dict[str, tuple[int, float]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -85,7 +86,7 @@ class Watcher:
             if has_cache and self._sigs.get(run_id) == sig:
                 continue  # nothing changed since last successful pass
             try:
-                res = convert_run(run_dir, cache_run_dir, run_id)
+                res = convert_run(run_dir, cache_run_dir, run_id, n_jobs=self.jobs)
                 self._sigs[run_id] = sig
                 if res.new_rows or not has_cache:
                     converted += 1

@@ -1,10 +1,16 @@
 """Command line entrypoints for tb_like.
 
-    uv run tblike build-runs --count 200      # make symlinked test runs
-    uv run tblike convert <run_dir> [run_id]  # ingest one run -> parquet
-    uv run tblike clone <src_run_id> --count 200  # fan a converted run out (test)
-    uv run tblike scan                        # one incremental watcher pass
-    uv run tblike serve [--port 8000]         # dashboard + background watcher
+Primary usage — just point it at a folder of runs and open the dashboard:
+
+    tblike <runs_dir> [--port 8000] [--jobs 8]
+
+The background watcher converts runs to Parquet automatically and keeps the
+cache in sync. Advanced/scriptable subcommands are also available:
+
+    tblike convert <run_dir> [run_id]   # ingest one run -> parquet (one-off)
+    tblike scan                         # one incremental ingest pass, no server
+    tblike build-runs --count 200       # make symlinked test runs (dev)
+    tblike clone <src_run_id> --count N # fan a converted run out (dev)
 """
 
 from __future__ import annotations
@@ -113,49 +119,82 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print(f"scan done in {time.time()-t0:.1f}s: {res}")
 
 
-def cmd_serve(args: argparse.Namespace) -> None:
+DEFAULT_JOBS = max(1, (os.cpu_count() or 2) - 1)
+
+
+def run_serve(argv: list[str]) -> None:
     import uvicorn
 
-    os.environ.setdefault("TBLIKE_RUNS", args.runs_dir)
-    os.environ.setdefault("TBLIKE_CACHE", args.cache_dir)
+    p = argparse.ArgumentParser(
+        prog="tblike",
+        description="Serve the tb_like dashboard for a folder of runs (auto-ingests in the background).",
+    )
+    p.add_argument("runs_dir", help="folder containing run subdirs with events.out.tfevents.* files")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--cache-dir", default=None,
+                   help="Parquet cache directory (default: <runs_dir>/.tblike_cache)")
+    p.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS,
+                   help=f"parallel parse workers for background conversion (default: {DEFAULT_JOBS})")
+    p.add_argument("--interval", type=float, default=10.0, help="watcher poll interval, seconds")
+    p.add_argument("--no-watch", action="store_true", help="serve only; do not ingest in the background")
+    args = p.parse_args(argv)
+
+    if not os.path.isdir(args.runs_dir):
+        p.error(f"runs_dir not found: {args.runs_dir}")
+    cache = args.cache_dir or os.path.join(args.runs_dir, ".tblike_cache")
+    os.environ["TBLIKE_RUNS"] = os.path.abspath(args.runs_dir)
+    os.environ["TBLIKE_CACHE"] = os.path.abspath(cache)
+    os.environ["TBLIKE_WATCH"] = "0" if args.no_watch else "1"
+    os.environ["TBLIKE_INTERVAL"] = str(args.interval)
+    os.environ["TBLIKE_JOBS"] = str(args.jobs)
+    print(f"tb_like → http://{args.host}:{args.port}   runs={args.runs_dir}  cache={cache}")
     uvicorn.run("tblike.server:app", host=args.host, port=args.port, reload=False)
 
 
-def main(argv: list[str] | None = None) -> None:
+def run_advanced(argv: list[str]) -> None:
     p = argparse.ArgumentParser(prog="tblike")
     p.add_argument("--runs-dir", default="runs")
     p.add_argument("--cache-dir", default="cache")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build-runs", help="create symlinked test runs")
+    c = sub.add_parser("convert", help="ingest one run into parquet")
+    c.add_argument("run_dir")
+    c.add_argument("run_id", nargs="?")
+    c.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS,
+                   help="parallel worker processes for event-file parsing")
+    c.set_defaults(func=cmd_convert)
+
+    s = sub.add_parser("scan", help="one incremental ingest pass, no server")
+    s.set_defaults(func=cmd_scan)
+
+    b = sub.add_parser("build-runs", help="create symlinked test runs (dev)")
     b.add_argument("--source", default="data")
     b.add_argument("--count", type=int, default=200)
     b.add_argument("--prefix", default="run_")
     b.set_defaults(func=cmd_build_runs)
 
-    c = sub.add_parser("convert", help="ingest one run into parquet")
-    c.add_argument("run_dir")
-    c.add_argument("run_id", nargs="?")
-    c.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
-                   help="parallel worker processes for event-file parsing (default: ncpu-1)")
-    c.set_defaults(func=cmd_convert)
-
-    cl = sub.add_parser("clone", help="fan a converted run out into N runs (test)")
+    cl = sub.add_parser("clone", help="fan a converted run out into N runs (dev)")
     cl.add_argument("src_run_id")
     cl.add_argument("--count", type=int, default=200)
     cl.add_argument("--prefix", default="run_")
     cl.set_defaults(func=cmd_clone)
 
-    s = sub.add_parser("scan", help="one incremental ingest pass")
-    s.set_defaults(func=cmd_scan)
-
-    sv = sub.add_parser("serve", help="run the dashboard server")
-    sv.add_argument("--host", default="127.0.0.1")
-    sv.add_argument("--port", type=int, default=8000)
-    sv.set_defaults(func=cmd_serve)
-
     args = p.parse_args(argv)
     args.func(args)
+
+
+ADVANCED = {"convert", "scan", "build-runs", "clone"}
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ADVANCED:
+        run_advanced(argv)            # power-user subcommands
+    elif not argv or argv[0] in ("-h", "--help"):
+        run_serve(["--help"])         # default command's help
+    else:
+        run_serve(argv)               # `tblike <runs_dir> [opts]`
 
 
 if __name__ == "__main__":
