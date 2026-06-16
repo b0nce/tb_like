@@ -4,7 +4,19 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>tb_like — fast scalar viewer</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Resolve all relative URLs against the app's mount path so it works behind
+       a reverse proxy / notebook sub-path (e.g. /…/notebook/<id>/). Must run
+       before the asset tags below. -->
+  <script>
+    (function () {
+      var p = location.pathname;
+      if (!p.endsWith("/")) p += "/";
+      var b = document.createElement("base");
+      b.href = p;
+      document.head.appendChild(b);
+    })();
+  </script>
+  <link rel="stylesheet" href="static/style.css" />
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 </head>
 <body>
@@ -79,6 +91,6 @@
     </main>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="static/app.js"></script>
 </body>
 </html>

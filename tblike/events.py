@@ -87,6 +87,21 @@ def _decode_scalar(value) -> float | None:
     return None
 
 
+def _decode_text(value) -> str | None:
+    """Decode a text summary (string tensor, e.g. a logged config) to str."""
+    if value.WhichOneof("value") != "tensor":
+        return None
+    if value.tensor.dtype != types_pb2.DT_STRING:
+        return None
+    arr = tensor_util.make_ndarray(value.tensor)
+    if arr.size == 0:
+        return None
+    parts = []
+    for s in arr.reshape(-1):
+        parts.append(s.decode("utf-8", "replace") if isinstance(s, bytes) else str(s))
+    return "\n".join(parts)
+
+
 def plan_files(run_dir: str, state: RunIngestState) -> tuple[list[tuple[str, int]], int]:
     """Decide which event files need (re)parsing for an incremental pass.
 

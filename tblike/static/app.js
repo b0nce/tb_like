@@ -72,7 +72,7 @@ function idle(msg) {
 async function loadRuns() {
   busy("loading runs…");
   try {
-    const r = await fetch("/api/runs").then((x) => x.json());
+    const r = await fetch("api/runs").then((x) => x.json());
     state.runs = r.runs.sort((a, b) => a.display_name.localeCompare(b.display_name));
     renderRunList();
     $("run-count").textContent = `(${state.runs.length})`;
@@ -99,7 +99,7 @@ async function loadTags(force = false) {
   busy(sel.length ? `loading tags for ${sel.length} run(s)…` : "loading tags…");
   if (!haveTags) $("tag-list").innerHTML = `<div class="placeholder">loading tags…</div>`;
   try {
-    const r = await fetch("/api/tags?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json());
+    const r = await fetch("api/tags?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json());
     state.tags = r.tags;
     state.loadedTagCounts = new Set(counts);
     renderTagTree();
@@ -111,7 +111,7 @@ async function loadTags(force = false) {
 
 async function loadStatus() {
   try {
-    const s = await fetch("/api/status").then((x) => x.json());
+    const s = await fetch("api/status").then((x) => x.json());
     const w = s.watcher || {};
     const wtxt = w.at ? `watcher ok (${w.runs} scanned)` : "watcher starting…";
     // only show ambient watcher status when nothing is selected / in flight
@@ -632,7 +632,7 @@ async function ensureChart(card) {
   // Per the sub-second rule: only reveal the spinner ring if the fetch is slow.
   const slowTimer = setTimeout(() => card.classList.add("loading"), 800);
   try {
-    const resp = await fetch("/api/series", {
+    const resp = await fetch("api/series", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_ids: [...state.selectedRuns], tags: [tag], max_points: optMaxPoints() }),
@@ -744,7 +744,7 @@ async function refreshSelected() {
   btn.disabled = true;
   busy(`refreshing ${runs.length} run(s) from disk…`);
   try {
-    const r = await fetch("/api/refresh", {
+    const r = await fetch("api/refresh", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ run_ids: runs }),
     }).then((x) => x.json());
