@@ -8,7 +8,9 @@ const state = {
   runColor: new Map(),
   expanded: new Set(),      // group paths currently expanded in the tag tree
   cards: new Map(),         // tag -> { fetchSig, series, loading } (lazy chart state)
-  visible: new Set(),       // tags whose chart is currently in the viewport
+  visible: new Set(),       // tags near the viewport (wide zone) — drives data prefetch
+  onscreen: new Set(),      // tags in/near the viewport (narrow zone) — drives rendering
+  live: new Set(),          // tags with a live Plotly (WebGL) plot — capped (see MAX_LIVE_PLOTS)
   lastFilter: undefined,    // last tag-filter value (to auto-expand matches once)
   loadedTagCounts: new Set(), // num_tags values whose tag set is already loaded
   collapsedGroups: new Set(), // top-level chart groups the user has collapsed
@@ -563,19 +565,36 @@ function outlierRange(series, logy) {
 const fetchSig = () =>
   JSON.stringify([[...state.selectedRuns].sort(), optMaxPoints(), optXaxis()]);
 
-// Candidate cards = those within a wide margin of the viewport. The scheduler
-// (below) decides *which* of them to fetch first. `state.visible` here means
-// "near the viewport" (the candidate pool), kept small so scoring is cheap.
-const observer = new IntersectionObserver(
+// Two zones, because rendering a scattergl chart is far costlier than fetching
+// its data. The WIDE zone (state.visible) prefetches series over the network so
+// data is ready well ahead of scroll — dozens of charts stay cached and redraw
+// instantly. The NARROW zone (state.onscreen) decides which charts actually get
+// a (WebGL-backed) plot. Each scattergl plot holds a WebGL context and browsers
+// hard-cap these at ~16 (Chrome) — exceed it and the oldest are silently killed,
+// leaving the "broken image" tiles. So we render at most MAX_LIVE_PLOTS (the
+// browser-safe ceiling) and purge the rest, redrawing from cache on return.
+const MAX_LIVE_PLOTS = 16;
+
+const observer = new IntersectionObserver(   // wide: prefetch data (cheap, no WebGL)
   (entries) => {
     for (const e of entries) {
       const tag = e.target.dataset.tag;
-      if (e.isIntersecting) state.visible.add(tag);
-      else state.visible.delete(tag);
+      if (e.isIntersecting) state.visible.add(tag); else state.visible.delete(tag);
     }
     pump();
   },
-  { root: null, rootMargin: "1200px 0px", threshold: 0 }
+  { root: null, rootMargin: "2400px 0px", threshold: 0 }   // ~32+ charts kept cached
+);
+
+const renderObserver = new IntersectionObserver(   // narrow: render/purge plots
+  (entries) => {
+    for (const e of entries) {
+      const tag = e.target.dataset.tag;
+      if (e.isIntersecting) state.onscreen.add(tag); else state.onscreen.delete(tag);
+    }
+    renderOnscreen();
+  },
+  { root: null, rootMargin: "450px 0px", threshold: 0 }   // ~enough to fill the live cap
 );
 
 // ---- priority fetch scheduler ----------------------------------------------
@@ -584,8 +603,8 @@ let inflight = 0;
 let scrollDir = 1;          // +1 scrolling down, -1 up
 let lastScrollTop = 0;
 
-// Score a candidate: lower = fetched sooner. On-screen cards win; off-screen
-// cards are ranked by distance, with the scroll direction discounted 3×.
+// Score a candidate: lower = nearer the viewport. On-screen cards win; off-screen
+// cards are ranked by distance, with the scroll direction discounted 4×.
 function score(card) {
   const r = card.getBoundingClientRect();
   const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -595,14 +614,16 @@ function score(card) {
   const ahead = Math.sign(d) === scrollDir;        // card lies in scroll direction
   return 1e6 + Math.abs(d) * (ahead ? 1 : 4);      // off-screen always after on-screen
 }
+const scoreTag = (tag) => { const c = $("chart-" + cssId(tag)); return c ? score(c) : Infinity; };
 
+// pickNext / pump fetch DATA only (no WebGL): the next visible card lacking fresh series.
 function pickNext() {
   let best = null, bestScore = Infinity;
   const sig = fetchSig();
   for (const tag of state.visible) {
     const cs = state.cards.get(tag);
     if (!cs || cs.loading) continue;
-    if (cs.series && cs.fetchSig === sig) continue;  // already fresh
+    if (cs.series && cs.fetchSig === sig) continue;  // data already fresh
     const card = $("chart-" + cssId(tag));
     if (!card) continue;
     const sc = score(card);
@@ -611,12 +632,50 @@ function pickNext() {
   return best;
 }
 
+function evictPlot(tag) {
+  const cs = state.cards.get(tag);
+  const plotDiv = $("plot-" + cssId(tag));
+  if (plotDiv && plotDiv._fullLayout) { try { Plotly.purge(plotDiv); } catch {} }  // release the WebGL context
+  if (plotDiv) plotDiv.style.display = "none";
+  const card = $("chart-" + cssId(tag));
+  if (card) {
+    card.classList.remove("loading");
+    card.classList.add("pending-card");
+    if (!card.querySelector(".chart-spinner")) {   // restore the quiet placeholder
+      const ph = document.createElement("div");
+      ph.className = "chart-spinner quiet";
+      ph.innerHTML = `<div class="ring"></div><div class="cap">${esc(tag)}</div>`;
+      card.insertBefore(ph, plotDiv || null);
+    }
+  }
+  if (cs) cs.drawn = false;
+  state.live.delete(tag);
+}
+
+// Single authority over which charts are live: render the closest MAX_LIVE_PLOTS
+// on-screen cards that have fresh data, purge everything else. Idempotent — safe
+// to call on any scroll/observer/fetch event without thrashing.
+function renderOnscreen() {
+  const sig = fetchSig();
+  const renderable = [...state.onscreen].filter((t) => {
+    const cs = state.cards.get(t);
+    return cs && cs.series && cs.fetchSig === sig;
+  });
+  renderable.sort((a, b) => scoreTag(a) - scoreTag(b));   // closest first
+  const keep = new Set(renderable.slice(0, MAX_LIVE_PLOTS));
+  for (const t of [...state.live]) if (!keep.has(t)) evictPlot(t);   // purge the rest
+  for (const t of keep) {
+    const cs = state.cards.get(t), card = $("chart-" + cssId(t));
+    if (card && !(cs.drawn && cs.fetchSig === sig)) drawCard(card, cs.series);
+  }
+}
+
 function pump() {
   while (inflight < MAX_CONCURRENT) {
     const card = pickNext();
     if (!card) break;
     inflight++;
-    ensureChart(card).finally(() => { inflight--; pump(); });
+    fetchCard(card).finally(() => { inflight--; pump(); });
   }
 }
 
@@ -630,11 +689,17 @@ function renderGrid() {
     observer.takeRecords();
     for (const el of [...charts.children]) {
       if (el === panel) continue;
-      if (el.dataset && el.dataset.tag) observer.unobserve(el);
+      if (el.dataset && el.dataset.tag) {
+        observer.unobserve(el); renderObserver.unobserve(el);
+        const pd = document.getElementById("plot-" + cssId(el.dataset.tag));
+        if (pd && pd._fullLayout) { try { Plotly.purge(pd); } catch {} }
+      }
       el.remove();
     }
     state.cards.clear();
     state.visible.clear();
+    state.onscreen.clear();
+    state.live.clear();
     charts.appendChild(panel);
     return;
   }
@@ -642,7 +707,13 @@ function renderGrid() {
   const want = new Set(tags);
   for (const el of [...charts.children]) {
     const t = el.dataset && el.dataset.tag;
-    if (t && !want.has(t)) { observer.unobserve(el); el.remove(); state.cards.delete(t); state.visible.delete(t); }
+    if (t && !want.has(t)) {
+      observer.unobserve(el); renderObserver.unobserve(el);
+      const pd = document.getElementById("plot-" + cssId(t));
+      if (pd && pd._fullLayout) { try { Plotly.purge(pd); } catch {} }  // free the WebGL context
+      el.remove();
+      state.cards.delete(t); state.visible.delete(t); state.onscreen.delete(t); state.live.delete(t);
+    }
   }
   const hadCards = charts.children.length > 0;
   const newCards = [];
@@ -666,13 +737,15 @@ function renderGrid() {
       if (el) { anchor = el; break; }
     }
     charts.insertBefore(card, anchor);
-    state.cards.set(tag, { fetchSig: null, series: null, loading: false });
+    state.cards.set(tag, { fetchSig: null, series: null, loading: false, drawn: false });
     observer.observe(card);
+    renderObserver.observe(card);
     newCards.push(card);
   }
   syncGroupHeaders();
   charts.appendChild(panel);   // keep the diff panel as the last block
-  pump();
+  pump();              // fetch data for the wide zone
+  renderOnscreen();    // draw any already-cached cards now on-screen
   if (hadCards && newCards.length) maybeShowNewPill(newCards);
 }
 
@@ -690,12 +763,14 @@ function syncGroupHeaders() {
     byGroup.get(g).push(c);
   }
   const multi = byGroup.size >= 2;
+  charts.classList.toggle("has-groups", multi);   // enables the per-card collapse button
   for (const g of order) {
     const gcards = byGroup.get(g);
     const collapsed = multi && state.collapsedGroups.has(g);
     if (multi) {
       const hdr = document.createElement("div");
       hdr.className = "group-sep";
+      hdr.dataset.group = g;
       hdr.innerHTML =
         `<span class="gcaret">${collapsed ? "▶" : "▼"}</span>` +
         `<span class="gname">${esc(g)}</span>` +
@@ -705,13 +780,14 @@ function syncGroupHeaders() {
     }
     for (const c of gcards) c.style.display = collapsed ? "none" : "";
   }
+  updateGroupFab();
 }
 
 function toggleGroup(g) {
   if (state.collapsedGroups.has(g)) state.collapsedGroups.delete(g);
   else state.collapsedGroups.add(g);
   syncGroupHeaders();
-  requestAnimationFrame(pump);   // expanding may reveal cards that now need loading
+  requestAnimationFrame(() => { pump(); renderOnscreen(); });   // reveal/draw newly shown cards
 }
 
 // ---- text-diff panel (always the last block in the charts area) ------------
@@ -840,16 +916,18 @@ function diffLines(aText, bText) {
   return out;
 }
 
-async function ensureChart(card) {
+// Fetch a card's series into the cache (no WebGL). Rendering is left to
+// renderOnscreen, which draws it iff it's on-screen and within the live cap.
+async function fetchCard(card) {
   const tag = card.dataset.tag;
   const cs = state.cards.get(tag);
   if (!cs) return;
   const sig = fetchSig();
-  if (cs.series && cs.fetchSig === sig) { drawCard(card, cs.series); return; }  // already fresh
+  if (cs.series && cs.fetchSig === sig) { renderOnscreen(); return; }  // data ready
   if (cs.loading) return;
   cs.loading = true;
-  // Per the sub-second rule: only reveal the spinner ring if the fetch is slow.
-  const slowTimer = setTimeout(() => card.classList.add("loading"), 800);
+  // Per the sub-second rule: only reveal the spinner ring if on-screen and slow.
+  const slowTimer = setTimeout(() => { if (state.onscreen.has(tag)) card.classList.add("loading"); }, 800);
   try {
     const resp = await fetch("api/series", {
       method: "POST",
@@ -859,7 +937,8 @@ async function ensureChart(card) {
     clearTimeout(slowTimer);
     cs.series = resp.series || [];
     cs.fetchSig = sig;
-    drawCard(card, cs.series);
+    cs.drawn = false;
+    renderOnscreen();   // draw now if it's on-screen
   } catch (e) {
     clearTimeout(slowTimer);
     card.querySelector(".chart-spinner div:last-child")?.replaceChildren(document.createTextNode("failed to load"));
@@ -952,6 +1031,9 @@ function drawCard(card, series) {
       `|${win ? win[0] + "-" + win[1] : "fullstep"}`,
   };
   Plotly.react("plot-" + cssId(tag), traces, layout, { responsive: true, displaylogo: false });
+  const cs = state.cards.get(tag);
+  if (cs) cs.drawn = true;
+  state.live.add(tag);   // renderOnscreen owns eviction; this just records the live context
 }
 
 // ---- "scroll to new charts" pill -------------------------------------------
@@ -984,16 +1066,51 @@ function maybeShowNewPill(newCards) {
   });
 }
 
+// ---- "jump to top of group" floating button --------------------------------
+const _groupFab = document.createElement("button");
+_groupFab.id = "groupfab";
+_groupFab.title = "scroll to the top of this group";
+document.body.appendChild(_groupFab);
+_groupFab.onclick = () => {
+  const g = currentTopGroup();
+  const hdr = g && chartsEl().querySelector(`.group-sep[data-group="${CSS.escape(g)}"]`);
+  hdr?.scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
+// The group of the topmost chart currently visible at the top of the scroll area.
+function currentTopGroup() {
+  const charts = chartsEl();
+  const top = charts.getBoundingClientRect().top;
+  let best = null, bestTop = Infinity;
+  for (const el of charts.children) {
+    if (!el.dataset || !el.dataset.tag || el.style.display === "none") continue;
+    const r = el.getBoundingClientRect();
+    if (r.bottom <= top + 4) continue;                    // fully scrolled above
+    if (r.top < bestTop) { bestTop = r.top; best = el; }
+  }
+  return best ? best.dataset.tag.split("/")[0] : null;
+}
+
+// Show the button only when the current group's header has scrolled out of view above.
+function updateGroupFab() {
+  const charts = chartsEl();
+  if (!charts.classList.contains("has-groups")) { _groupFab.classList.remove("show"); return; }
+  const g = currentTopGroup();
+  const hdr = g && charts.querySelector(`.group-sep[data-group="${CSS.escape(g)}"]`);
+  const top = charts.getBoundingClientRect().top;
+  if (hdr && hdr.getBoundingClientRect().top < top - 8) {
+    _groupFab.innerHTML = `<span class="gf-arrow">↑</span><span class="gf-name">${esc(g)}</span>`;
+    _groupFab.classList.add("show");
+  } else {
+    _groupFab.classList.remove("show");
+  }
+}
+
 // ---- refresh selected runs from disk ---------------------------------------
 // Tear down every rendered Plotly chart so they rebuild cleanly (also clears any
 // glitched Plotly state). Cards drop back to their pending placeholder.
 function purgeRenderedCharts() {
-  for (const tag of state.cards.keys()) {
-    const plotDiv = $("plot-" + cssId(tag));
-    if (plotDiv && plotDiv._fullLayout) { try { Plotly.purge(plotDiv); } catch {} }
-    if (plotDiv) plotDiv.style.display = "none";
-    $("chart-" + cssId(tag))?.classList.add("pending-card");
-  }
+  for (const tag of [...state.cards.keys()]) evictPlot(tag);  // purge + reset to placeholder
 }
 
 async function refreshSelected() {
@@ -1023,9 +1140,9 @@ async function refreshSelected() {
 
 function updateRefreshBtn() { $("refresh-btn").disabled = !state.selectedRuns.size; }
 
-// Redraw the currently-visible charts from cached data (style-only changes).
+// Redraw the live charts from cached data (style-only changes).
 function redrawVisible() {
-  for (const tag of state.visible) {
+  for (const tag of [...state.live]) {
     const cs = state.cards.get(tag);
     const card = $("chart-" + cssId(tag));
     if (cs && cs.series && card) drawCard(card, cs.series);
@@ -1034,8 +1151,9 @@ function redrawVisible() {
 
 // Invalidate cached series (refetch-affecting change) and reload via the queue.
 function reloadVisible() {
-  for (const cs of state.cards.values()) cs.fetchSig = null;
+  for (const cs of state.cards.values()) { cs.fetchSig = null; cs.drawn = false; }
   pump();
+  renderOnscreen();   // drop now-stale plots; fresh ones redraw as fetches land
 }
 
 const scheduleGrid = debounce(renderGrid, 150);
@@ -1046,6 +1164,8 @@ function trackScroll(el) {
     const st = el === window ? window.scrollY : el.scrollTop;
     if (st !== lastScrollTop) { scrollDir = st > lastScrollTop ? 1 : -1; lastScrollTop = st; }
     pump();
+    renderOnscreen();   // re-pick the closest live charts as proximity changes
+    updateGroupFab();
   };
   el.addEventListener("scroll", handler, { passive: true });
 }
