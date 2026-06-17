@@ -12,6 +12,8 @@ const state = {
   lastFilter: undefined,    // last tag-filter value (to auto-expand matches once)
   loadedTagCounts: new Set(), // num_tags values whose tag set is already loaded
   collapsedGroups: new Set(), // top-level chart groups the user has collapsed
+  stepBounds: { min: null, max: null },  // global [min,max] step across loaded tags
+  stepRange: { lo: null, hi: null },     // user-chosen window (null = at the edge)
 };
 
 const CHART_WARN = 80;      // soft warning threshold for the pending counter
@@ -102,6 +104,7 @@ async function loadTags(force = false) {
     const r = await fetch("api/tags?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json());
     state.tags = r.tags;
     state.loadedTagCounts = new Set(counts);
+    recomputeStepBounds();
     renderTagTree();
     idle(`${Object.keys(state.tags).length.toLocaleString()} tags`);
   } catch (e) {
@@ -461,6 +464,71 @@ const optOutliers = () => $("outliers-on").checked;
 const optQLow = () => parseFloat($("q-low").value);
 const optQHigh = () => parseFloat($("q-high").value);
 
+// ---- global step range (limits every chart to a step window, client-side) --
+const _human = (n) => {
+  const a = Math.abs(n);
+  if (a >= 1e6) return (n / 1e6).toFixed(a % 1e6 ? 1 : 0) + "M";
+  if (a >= 1e3) return (n / 1e3).toFixed(a % 1e3 ? 1 : 0) + "k";
+  return String(n);
+};
+
+// Global step extent across all loaded tags. Snap the user's window to the new
+// edges if it was sitting at the old ones, otherwise clamp it inside the bounds.
+function recomputeStepBounds() {
+  let min = Infinity, max = -Infinity;
+  for (const t in state.tags) {
+    const m = state.tags[t];
+    if (m.min_step != null) min = Math.min(min, m.min_step);
+    if (m.max_step != null) max = Math.max(max, m.max_step);
+  }
+  if (!isFinite(min)) { min = 0; max = 0; }
+  const prev = state.stepBounds, r = state.stepRange;
+  const atLo = r.lo == null || prev.min == null || r.lo <= prev.min;
+  const atHi = r.hi == null || prev.max == null || r.hi >= prev.max;
+  state.stepBounds = { min, max };
+  r.lo = atLo ? min : Math.max(min, Math.min(r.lo, max));
+  r.hi = atHi ? max : Math.max(min, Math.min(r.hi, max));
+  syncStepSlider();
+}
+
+function syncStepSlider() {
+  const { min, max } = state.stepBounds, r = state.stepRange;
+  const lo = $("step-lo"), hi = $("step-hi"), val = $("step-range-val");
+  const usable = max > min;
+  for (const el of [lo, hi]) { el.min = min; el.max = max; el.disabled = !usable; }
+  // step granularity ~1000 ticks across the range, but at least 1
+  const gran = Math.max(1, Math.floor((max - min) / 1000)) || 1;
+  lo.step = hi.step = gran;
+  lo.value = r.lo; hi.value = r.hi;
+  val.textContent = (!usable || !stepRangeActive())
+    ? "all" : `${_human(r.lo)} … ${_human(r.hi)}`;
+}
+
+// Active window, or null when it spans the full extent (a no-op we skip).
+function stepRangeActive() {
+  const b = state.stepBounds, r = state.stepRange;
+  if (b.max == null || b.max <= b.min) return null;
+  const lo = r.lo ?? b.min, hi = r.hi ?? b.max;
+  if (lo <= b.min && hi >= b.max) return null;
+  return [lo, hi];
+}
+
+// Filter each series' points to the active step window (copy; leaves cache intact).
+function stepLimited(series) {
+  const win = stepRangeActive();
+  if (!win) return series;
+  const [lo, hi] = win;
+  return series.map((s) => {
+    const steps = [], values = [], wall = [];
+    for (let i = 0; i < s.steps.length; i++) {
+      const st = s.steps[i];
+      if (st < lo || st > hi) continue;
+      steps.push(st); values.push(s.values[i]); wall.push(s.wall_time[i]);
+    }
+    return { ...s, steps, values, wall_time: wall };
+  });
+}
+
 // quantile of an unsorted numeric array (linear interpolation)
 function quantileSorted(sorted, q) {
   const n = sorted.length;
@@ -665,10 +733,13 @@ function ensureDiffPanel() {
     panel.querySelector(".dcaret").textContent = collapsed ? "▶" : "▼";
     if (!collapsed) refreshDiffRuns();
   };
+  // Wire against `panel` directly — it isn't in the DOM yet, so $("diffpanel")
+  // (used by dq) would be null here and throw, taking renderGrid down with it.
+  const q = (s, w) => panel.querySelector(`.diff-side.${s} .d-${w}`);
   for (const s of ["a", "b"]) {
-    dq(s, "run").onchange = () => populateTags(s);
-    dq(s, "tag").onchange = () => populateSteps(s);
-    dq(s, "step").onchange = () => renderDiff();
+    q(s, "run").onchange = () => populateTags(s);
+    q(s, "tag").onchange = () => populateSteps(s);
+    q(s, "step").onchange = () => renderDiff();
   }
   return panel;
 }
@@ -797,9 +868,10 @@ function drawCard(card, series) {
   const plotDiv = $("plot-" + cssId(tag));
   if (plotDiv) plotDiv.style.display = "";
 
+  const view = stepLimited(series);
   const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
   const traces = [];
-  for (const s of series) {
+  for (const s of view) {
     const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
     const color = colorFor(s.run_id);
     if (smoothOn) {
@@ -812,26 +884,32 @@ function drawCard(card, series) {
         line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     }
   }
-  // Outlier clip sets an explicit y-range from value percentiles.
-  const clip = optOutliers() ? outlierRange(series, logy) : null;
+  // Outlier clip sets an explicit y-range from value percentiles (of the window).
+  const clip = optOutliers() ? outlierRange(view, logy) : null;
   const yaxis = { type: logy ? "log" : "linear", gridcolor: "#2a313c", zeroline: false };
   if (clip) { yaxis.range = clip; yaxis.autorange = false; }
+
+  // In step mode, pin the x-axis to the active window so the limit is exact.
+  const win = stepRangeActive();
+  const xAxisObj = { title: xaxis === "wall_time" ? "min" : "step", gridcolor: "#2a313c", zeroline: false };
+  if (win && xaxis === "step") { xAxisObj.range = win; xAxisObj.autorange = false; }
 
   const layout = {
     title: { text: tag, font: { size: 13 }, x: 0.01 },
     margin: { l: 48, r: 10, t: 28, b: 32 },
     paper_bgcolor: "#161b22", plot_bgcolor: "#161b22",
     font: { color: "#d7dde5", size: 10 },
-    xaxis: { title: xaxis === "wall_time" ? "min" : "step", gridcolor: "#2a313c", zeroline: false },
+    xaxis: xAxisObj,
     yaxis,
-    showlegend: series.length <= 12,
+    showlegend: view.length <= 12,
     legend: { font: { size: 9 }, orientation: "h", y: -0.2 },
     // "x unified" lists every series at the hovered step (overlapping lines included)
     hovermode: "x unified",
     hoverlabel: { namelength: 32, font: { size: 10 }, bgcolor: "#0f1419" },
     // uirevision preserves the user's zoom/pan across re-renders, but is bumped
     // when an axis-defining option changes so new ranges/clip actually apply.
-    uirevision: `${xaxis}|${logy}|${optOutliers() ? optQLow() + "-" + optQHigh() : "noclip"}`,
+    uirevision: `${xaxis}|${logy}|${optOutliers() ? optQLow() + "-" + optQHigh() : "noclip"}` +
+      `|${win ? win[0] + "-" + win[1] : "fullstep"}`,
   };
   Plotly.react("plot-" + cssId(tag), traces, layout, { responsive: true, displaylogo: false });
 }
@@ -982,6 +1060,24 @@ for (const id of ["logy", "smooth-on", "smooth", "outliers-on", "q-low", "q-high
   $(id).onchange = styleDebounced;
 }
 updateQReadout();
+
+// Global step range — client-side window, so redraw from cache (no refetch).
+const stepDebounced = debounce(redrawVisible, 120);
+function onStepInput(which) {
+  let lo = parseInt($("step-lo").value, 10), hi = parseInt($("step-hi").value, 10);
+  if (lo > hi) { if (which === "lo") hi = lo; else lo = hi; }   // keep lo ≤ hi
+  state.stepRange.lo = lo; state.stepRange.hi = hi;
+  syncStepSlider();
+  stepDebounced();
+}
+$("step-lo").oninput = () => onStepInput("lo");
+$("step-hi").oninput = () => onStepInput("hi");
+$("step-reset").onclick = () => {
+  state.stepRange.lo = state.stepBounds.min;
+  state.stepRange.hi = state.stepBounds.max;
+  syncStepSlider(); redrawVisible();
+};
+
 const refetchDebounced = debounce(reloadVisible, 200);
 for (const id of ["max-points", "xaxis"]) {
   $(id).oninput = refetchDebounced;
