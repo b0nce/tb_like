@@ -168,22 +168,40 @@ def parse_file(path: str, already: int = 0) -> dict:
     }
 
 
-def parse_texts(path: str) -> dict:
+def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
     """Scan one event file for text summaries only (e.g. a logged config).
 
     Top-level/picklable for joblib. Ignores ingest state and scalars entirely,
     so it can backfill text for runs ingested before text support existed
-    without re-parsing or rewriting their Parquet. Returns
+    without re-parsing or rewriting their Parquet.
+
+    Text summaries (configs) are written near the *start* of each event file,
+    before the bulk of scalars. To avoid draining millions of scalar records,
+    by default we stop a file after ``head_records`` if no text has appeared,
+    and ``gap`` records after the last text once some has. Pass
+    ``head_records=0`` and ``gap=0`` for an exhaustive scan. Returns
     ``{"name", "texts": [(tag, step, wall_time, text), ...]}``.
     """
     texts: list[tuple[str, int, float, str]] = []
+    seen = since = 0
+    found = False
     for ev in EventFileLoader(path).Load():
-        if not ev.HasField("summary"):
-            continue
-        for v in ev.summary.value:
-            txt = _decode_text(v)
-            if txt is not None:
-                texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
+        seen += 1
+        got = False
+        if ev.HasField("summary"):
+            for v in ev.summary.value:
+                txt = _decode_text(v)
+                if txt is not None:
+                    texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
+                    got = True
+        if got:
+            found, since = True, 0
+        else:
+            since += 1
+        if head_records and not found and seen >= head_records:
+            break  # no text in this file's head -> assume none (scalar-only file)
+        if gap and found and since >= gap:
+            break  # passed the text block at the file's start
     return {"name": os.path.basename(path), "texts": texts}
 
 

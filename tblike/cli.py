@@ -126,7 +126,8 @@ def cmd_backfill_text(args: argparse.Namespace) -> None:
         cache_run_dir = os.path.join(cache_dir, run_id)
         n = backfill_texts(
             run_dir, cache_run_dir,
-            on_file=_file_progress(run_id), n_jobs=args.jobs, force=args.force,
+            on_file=_file_progress(run_id), n_jobs=args.jobs,
+            force=args.force, full=args.full,
         )
         if n < 0:
             skipped += 1
@@ -206,6 +207,8 @@ def run_advanced(argv: list[str]) -> None:
                     help="parallel worker processes for the text re-scan")
     bt.add_argument("--force", action="store_true",
                     help="re-scan even runs that already have text")
+    bt.add_argument("--full", action="store_true",
+                    help="exhaustive scan (every record) for text logged mid-run")
     bt.set_defaults(func=cmd_backfill_text)
 
     b = sub.add_parser("build-runs", help="create symlinked test runs (dev)")

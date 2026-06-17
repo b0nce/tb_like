@@ -173,52 +173,79 @@ def _merge_tag_stats(existing: dict, df: pl.DataFrame) -> dict:
     return existing
 
 
+def _dedup_texts(raw: list[tuple]) -> dict:
+    """Fold (tag, step, wall, text) tuples into {tag: {step: {wall_time, text}}},
+    keeping only entries where the text *changes* — a config repeated across
+    every step collapses to a single entry (its first occurrence)."""
+    by_tag: dict[str, list[tuple]] = {}
+    for tag, step, wall, text in raw:
+        by_tag.setdefault(tag, []).append((step, wall, text))
+    out: dict[str, dict] = {}
+    for tag, items in by_tag.items():
+        items.sort(key=lambda x: x[0])
+        kept: dict[str, dict] = {}
+        last = None
+        for step, wall, text in items:
+            if text != last:
+                kept[str(step)] = {"wall_time": wall, "text": text}
+                last = text
+        out[tag] = kept
+    return out
+
+
 def backfill_texts(
     run_dir: str,
     cache_run_dir: str,
     on_file=None,
     n_jobs: int = 1,
     force: bool = False,
+    full: bool = False,
 ) -> int:
-    """Re-scan a run's event files for text summaries and merge into texts.json.
+    """Re-scan a run's event files for text summaries and write texts.json.
 
     Unlike :func:`convert_run`, this ignores per-file ingest state, so it
     backfills text for runs converted before text support existed — without
-    re-parsing scalars or rewriting Parquet. Idempotent (last write wins).
+    re-parsing scalars or rewriting Parquet.
 
-    Returns the number of (tag, step) texts now stored, or ``-1`` if the run
-    already had text and ``force`` was not set (skipped as a cheap no-op).
+    Fast by default: text (configs) sits at the head of each event file, so the
+    scan stops early past it rather than draining millions of scalar records
+    (see :func:`parse_texts`). Pass ``full=True`` for an exhaustive scan.
+    Repeated identical texts are de-duplicated to one entry per change.
+
+    Returns the number of (tag, step) texts stored, or ``-1`` if the run already
+    had text and ``force`` was not set (skipped as a cheap no-op).
     """
     if load_index(cache_run_dir) is None:
         return -1  # nothing converted here yet; nothing to attach text to
-    texts = _load_texts(cache_run_dir)
-    if texts and not force:
-        return -1  # already has text — skip the full re-scan
+    if _load_texts(cache_run_dir) and not force:
+        return -1  # already has text — skip the re-scan
 
     files = list_event_files(run_dir)
     total = len(files)
     done = 0
+    raw: list[tuple] = []
+    scan = (0, 0) if full else (512, 512)  # (head_records, gap)
 
     def handle(res: dict) -> None:
         nonlocal done
-        for tag, step, wall, text in res["texts"]:
-            texts.setdefault(tag, {})[str(step)] = {"wall_time": wall, "text": text}
+        raw.extend(res["texts"])
         done += 1
         if on_file:
             on_file(done, total, res["name"])
 
     if n_jobs == 1:
         for path in files:
-            handle(parse_texts(path))
+            handle(parse_texts(path, *scan))
     else:
         from joblib import Parallel, delayed
 
         gen = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
-            delayed(parse_texts)(path) for path in files
+            delayed(parse_texts)(path, *scan) for path in files
         )
         for res in gen:
             handle(res)
 
+    texts = _dedup_texts(raw)
     _atomic_write_json(os.path.join(cache_run_dir, "texts.json"), texts)
     index = load_index(cache_run_dir)
     if index is not None:
@@ -317,9 +344,14 @@ def convert_run(
     # Text summaries (e.g. the logged config) live in a small sidecar, keyed by
     # tag -> step. Merged across passes, last write wins.
     texts = _load_texts(cache_run_dir)
-    for tag, step, wall, text in new_texts:
-        texts.setdefault(tag, {})[str(step)] = {"wall_time": wall, "text": text}
     if new_texts:
+        # Fold new text in, de-duplicating repeats: a config logged every step
+        # collapses to one entry per change (across passes too).
+        prior = [
+            (tag, int(step), e.get("wall_time", 0.0), e.get("text", ""))
+            for tag, by in texts.items() for step, e in by.items()
+        ]
+        texts = _dedup_texts(prior + list(new_texts))
         _atomic_write_json(os.path.join(cache_run_dir, "texts.json"), texts)
 
     # Metadata is (re)read cheaply each pass so config edits are picked up.
