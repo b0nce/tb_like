@@ -12,7 +12,8 @@ const state = {
   lastFilter: undefined,    // last tag-filter value (to auto-expand matches once)
   loadedTagCounts: new Set(), // num_tags values whose tag set is already loaded
   collapsedGroups: new Set(), // top-level chart groups the user has collapsed
-  showSelectedOnly: false,    // tree shows only currently-selected tags
+  showSelectedOnly: false,    // tree shows only the snapshot taken when toggled on
+  selectedSnapshot: new Set(),// tags shown in "selected" mode (frozen at toggle)
   stepBounds: { min: null, max: null },  // global [min,max] step across loaded tags
   stepRange: { lo: null, hi: null },     // user-chosen window (null = at the edge)
 };
@@ -321,7 +322,9 @@ function renderTagTree() {
   const match = makeTagMatcher(filter);
   let names = Object.keys(state.tags);
   if (match) names = names.filter(match);
-  if (state.showSelectedOnly) names = names.filter((t) => state.selectedTags.has(t));
+  // Selected mode shows the frozen snapshot, so deselecting just greys an item
+  // out (it stays put) instead of removing it from the list.
+  if (state.showSelectedOnly) names = names.filter((t) => state.selectedSnapshot.has(t));
   const root = buildTagTree(names);
 
   // When the filter or selected-only mode *changes*, auto-expand the groups
@@ -374,8 +377,7 @@ function renderTagTree() {
         cb.checked = state.selectedTags.has(child.tag);
         cb.onchange = () => {
           cb.checked ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
-          updatePending(); scheduleGrid();
-          if (state.showSelectedOnly) renderTagTree();  // drop it from the list
+          updatePending(); scheduleGrid();   // in selected mode the row stays (snapshot), just toggles
         };
       }
 
@@ -1082,6 +1084,8 @@ $("tags-expand").onclick = () => {
 };
 $("tags-selected").onclick = () => {
   state.showSelectedOnly = !state.showSelectedOnly;
+  // Freeze the shown set on entering, so toggling rows doesn't shrink the list.
+  if (state.showSelectedOnly) state.selectedSnapshot = new Set(state.selectedTags);
   $("tags-selected").classList.toggle("active", state.showSelectedOnly);
   renderTagTree();
 };
