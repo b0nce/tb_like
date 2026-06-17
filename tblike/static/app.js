@@ -876,9 +876,9 @@ function drawCard(card, series) {
     const color = colorFor(s.run_id);
     if (smoothOn) {
       traces.push({ x, y: s.values, type: "scattergl", mode: "lines",
-        line: { color, width: 1 }, opacity: 0.25, hoverinfo: "skip", showlegend: false, name: s.display_name });
+        line: { color, width: 0.7 }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
       traces.push({ x, y: smoothValues(s.values, weight), type: "scattergl", mode: "lines",
-        line: { color, width: 1.6 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+        line: { color, width: 2.2 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     } else {
       traces.push({ x, y: s.values, type: "scattergl", mode: "lines",
         line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
