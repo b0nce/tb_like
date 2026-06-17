@@ -109,16 +109,26 @@ async function loadTags(force = false) {
   }
 }
 
+let _prevReady = -1;
 async function loadStatus() {
-  try {
-    const s = await fetch("api/status").then((x) => x.json());
+  let s;
+  try { s = await fetch("api/status").then((x) => x.json()); } catch { return; }
+  const p = s.progress || {};
+  const processing = !!p.converting || (p.pending || 0) > 0;
+  // Persistent background-processing indicator (so runs appearing late is explained).
+  if (processing && !_busy) {
+    $("status").textContent = p.converting
+      ? `⏳ converting ${p.converting} … (${p.done}/${p.total} runs)`
+      : `⏳ ${p.pending} run(s) pending conversion…`;
+  } else if (!processing && !_busy && !state.selectedTags.size) {
     const w = s.watcher || {};
-    const wtxt = w.at ? `watcher ok (${w.runs} scanned)` : "watcher starting…";
-    // only show ambient watcher status when nothing is selected / in flight
-    if (!_busy && !state.selectedTags.size) {
-      $("status").textContent = `${s.num_runs} runs · ${wtxt}`;
-    }
-  } catch { /* ignore */ }
+    $("status").textContent = `${s.num_runs} runs · ${w.at ? "watcher ok" : "watcher starting…"}`;
+  }
+  // As runs finish converting, surface them in the list automatically.
+  if (s.num_runs !== _prevReady) {
+    _prevReady = s.num_runs;
+    if (state.runs.length !== s.num_runs) loadRuns();
+  }
 }
 
 // ---- rendering: lists ------------------------------------------------------
@@ -249,8 +259,8 @@ function compressChains(node) {
   for (let c of node.children.values()) {
     while (c.children.size === 1 && !c.tag) {
       const only = c.children.values().next().value;
-      if (only.sep !== "." || isInt(c.name) || isInt(only.name)) break;
-      c = { name: c.name + "." + only.name, sep: c.sep, synthetic: c.synthetic,
+      if (isInt(c.name) || isInt(only.name)) break;   // keep integer levels (layer indices)
+      c = { name: c.name + only.sep + only.name, sep: c.sep, synthetic: c.synthetic,
             children: only.children, tags: only.tags, tag: only.tag };
     }
     compressChains(c);
@@ -537,14 +547,20 @@ function pump() {
 
 function renderGrid() {
   const charts = chartsEl();
+  const panel = ensureDiffPanel();            // the text-diff block is pinned last
+  if (panel.parentNode !== charts) charts.appendChild(panel);
   // natural sort so layer indices order numerically (layers.2 before layers.10)
   const tags = [...state.selectedTags].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   if (!state.selectedRuns.size || !tags.length) {
     observer.takeRecords();
-    for (const el of [...charts.children]) if (el.dataset && el.dataset.tag) observer.unobserve(el);
+    for (const el of [...charts.children]) {
+      if (el === panel) continue;
+      if (el.dataset && el.dataset.tag) observer.unobserve(el);
+      el.remove();
+    }
     state.cards.clear();
     state.visible.clear();
-    charts.innerHTML = "";
+    charts.appendChild(panel);
     return;
   }
   $("empty")?.remove();
@@ -567,8 +583,9 @@ function renderGrid() {
     card.innerHTML =
       `<div class="chart-spinner quiet"><div class="ring"></div><div class="cap">${esc(tag)}</div></div>` +
       `<div class="plot" id="plot-${cssId(tag)}" style="display:none"></div>`;
-    // Insert in sorted position so a newly selected tag lands predictably.
-    let anchor = null;
+    // Insert in sorted position so a newly selected tag lands predictably;
+    // fall back to the diff panel so cards always precede it.
+    let anchor = panel;
     for (let j = +i + 1; j < tags.length; j++) {
       const el = document.getElementById("chart-" + cssId(tags[j]));
       if (el) { anchor = el; break; }
@@ -579,6 +596,7 @@ function renderGrid() {
     newCards.push(card);
   }
   syncGroupHeaders();
+  charts.appendChild(panel);   // keep the diff panel as the last block
   pump();
   if (hadCards && newCards.length) maybeShowNewPill(newCards);
 }
@@ -619,6 +637,129 @@ function toggleGroup(g) {
   else state.collapsedGroups.add(g);
   syncGroupHeaders();
   requestAnimationFrame(pump);   // expanding may reveal cards that now need loading
+}
+
+// ---- text-diff panel (always the last block in the charts area) ------------
+const _textCache = new Map();   // "run|tag|step" -> text
+let _diffIndex = {};            // {run_id: {display_name, tags: {tag: [{step, chars}]}}}
+const dq = (side, which) => $("diffpanel").querySelector(`.diff-side.${side} .d-${which}`);
+
+function ensureDiffPanel() {
+  let panel = $("diffpanel");
+  if (panel) return panel;
+  const side = (s) =>
+    `<div class="diff-side ${s}"><span class="sidetag">${s.toUpperCase()}</span>` +
+    `<select class="d-run" title="run"></select><select class="d-tag" title="text tag"></select>` +
+    `<select class="d-step" title="step"></select></div>`;
+  panel = document.createElement("div");
+  panel.id = "diffpanel";
+  panel.className = "diffpanel collapsed";
+  panel.innerHTML =
+    `<div class="diff-head"><span class="dcaret">▶</span><span>Text diff</span>` +
+    `<span class="dhint">— compare logged text (e.g. configs) across runs / steps</span></div>` +
+    `<div class="diff-body"><div class="diff-selectors">${side("a")}${side("b")}</div>` +
+    `<div class="diff-summary"></div>` +
+    `<div class="diff-view"><div class="diff-empty">Pick a text on each side to compare.</div></div></div>`;
+  panel.querySelector(".diff-head").onclick = () => {
+    const collapsed = panel.classList.toggle("collapsed");
+    panel.querySelector(".dcaret").textContent = collapsed ? "▶" : "▼";
+    if (!collapsed) refreshDiffRuns();
+  };
+  for (const s of ["a", "b"]) {
+    dq(s, "run").onchange = () => populateTags(s);
+    dq(s, "tag").onchange = () => populateSteps(s);
+    dq(s, "step").onchange = () => renderDiff();
+  }
+  return panel;
+}
+
+function fillSelect(sel, options, keep) {
+  const prev = keep && options.some((o) => o.value === sel.value) ? sel.value
+             : (options[0] ? options[0].value : "");
+  sel.innerHTML = options.map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+  sel.value = prev;
+}
+
+async function refreshDiffRuns() {
+  const panel = $("diffpanel");
+  if (!panel || panel.classList.contains("collapsed")) return;
+  const runs = [...state.selectedRuns];
+  const setEmpty = (m) => { panel.querySelector(".diff-view").innerHTML = `<div class="diff-empty">${esc(m)}</div>`; };
+  if (!runs.length) { _diffIndex = {}; return setEmpty("Select runs to compare their logged text."); }
+  try {
+    _diffIndex = (await fetch("api/text-index?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json())).runs || {};
+  } catch { _diffIndex = {}; }
+  const runOpts = Object.keys(_diffIndex).map((rid) => ({ value: rid, label: _diffIndex[rid].display_name || rid }));
+  if (!runOpts.length) {
+    for (const s of ["a", "b"]) { fillSelect(dq(s, "run"), []); fillSelect(dq(s, "tag"), []); fillSelect(dq(s, "step"), []); }
+    return setEmpty("No text summaries (e.g. config) found in the selected runs.");
+  }
+  for (const s of ["a", "b"]) { fillSelect(dq(s, "run"), runOpts, true); populateTags(s, true); }
+}
+
+function populateTags(side, keep) {
+  const rid = dq(side, "run").value;
+  const tags = _diffIndex[rid] ? Object.keys(_diffIndex[rid].tags) : [];
+  fillSelect(dq(side, "tag"), tags.map((t) => ({ value: t, label: t })), keep);
+  populateSteps(side, keep);
+}
+
+function populateSteps(side, keep) {
+  const rid = dq(side, "run").value, tag = dq(side, "tag").value;
+  const entries = (_diffIndex[rid] && _diffIndex[rid].tags[tag]) || [];
+  fillSelect(dq(side, "step"),
+    entries.map((e) => ({ value: String(e.step), label: `step ${e.step} (${e.chars} chars)` })), keep);
+  renderDiff();
+}
+
+async function getText(rid, tag, step) {
+  const key = `${rid}|${tag}|${step}`;
+  if (_textCache.has(key)) return _textCache.get(key);
+  const r = await fetch(`api/text?run=${encodeURIComponent(rid)}&tag=${encodeURIComponent(tag)}&step=${encodeURIComponent(step)}`)
+    .then((x) => x.json()).catch(() => ({ text: "" }));
+  _textCache.set(key, r.text || "");
+  return r.text || "";
+}
+
+const diffPick = (side) => ({ run: dq(side, "run").value, tag: dq(side, "tag").value, step: dq(side, "step").value });
+
+async function renderDiff() {
+  const panel = $("diffpanel");
+  const view = panel.querySelector(".diff-view"), sum = panel.querySelector(".diff-summary");
+  const a = diffPick("a"), b = diffPick("b");
+  if (!a.run || !a.tag || a.step === "" || !b.run || !b.tag || b.step === "") return;
+  view.innerHTML = `<div class="diff-empty">loading…</div>`;
+  const [ta, tb] = await Promise.all([getText(a.run, a.tag, a.step), getText(b.run, b.tag, b.step)]);
+  const rows = diffLines(ta, tb);
+  let add = 0, del = 0;
+  const html = rows.map((r) => {
+    if (r.t === "+") add++; else if (r.t === "-") del++;
+    const cls = r.t === "+" ? "add" : r.t === "-" ? "del" : "same";
+    return `<div class="dl ${cls}"><span class="gut">${r.t}</span><span class="txt">${esc(r.line) || " "}</span></div>`;
+  }).join("");
+  sum.innerHTML = (add || del)
+    ? `<span class="add">+${add}</span> / <span class="del">−${del}</span> lines changed`
+    : "identical";
+  view.innerHTML = html || `<div class="diff-empty">identical</div>`;
+}
+
+// Line diff via LCS; returns [{t:' '|'-'|'+', line}].
+function diffLines(aText, bText) {
+  const A = aText.split("\n"), B = bText.split("\n");
+  const n = A.length, m = B.length;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = []; let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) { out.push({ t: " ", line: A[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ t: "-", line: A[i] }); i++; }
+    else { out.push({ t: "+", line: B[j] }); j++; }
+  }
+  while (i < n) out.push({ t: "-", line: A[i++] });
+  while (j < m) out.push({ t: "+", line: B[j++] });
+  return out;
 }
 
 async function ensureChart(card) {
@@ -752,6 +893,7 @@ async function refreshSelected() {
     for (const cs of state.cards.values()) { cs.fetchSig = null; cs.series = null; }  // invalidate cache
     purgeRenderedCharts();                             // force a clean Plotly rebuild
     pump();                                            // refetch + redraw what's on screen
+    _textCache.clear(); refreshDiffRuns();             // text summaries may have changed
     loadRuns();                                        // refresh run row stats
     idle(`refreshed ${r.refreshed.length} run(s) · +${(r.new_rows || 0).toLocaleString()} rows`);
   } catch (e) {
@@ -795,7 +937,8 @@ function onRunsChanged() {
   updatePending();
   updateRefreshBtn();
   renderGrid();
-  reloadVisible();   // run set changed -> refetch what's on screen
+  refreshDiffRuns();   // update the text-diff run options (if the panel is open)
+  reloadVisible();     // run set changed -> refetch what's on screen
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -890,4 +1033,4 @@ updatePending();
 updateRefreshBtn();
 renderGrid();
 loadStatus();
-setInterval(loadStatus, 8000);
+setInterval(loadStatus, 3000);

@@ -56,6 +56,8 @@ class Watcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_scan: dict = {"at": 0.0, "converted": 0, "runs": 0, "errors": 0}
+        # live progress of the in-flight scan (for the dashboard's status line)
+        self.progress: dict = {"total": 0, "done": 0, "converting": None, "pending": 0}
 
     # ---- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -79,12 +81,18 @@ class Watcher:
     def scan_once(self) -> dict:
         converted = errors = 0
         runs = discover_runs(self.runs_dir)
-        for run_id, run_dir in runs:
+        total = len(runs)
+        # progress is updated *during* the pass so the UI can show live status
+        # while a big initial conversion is still running.
+        self.progress = {"total": total, "done": 0, "converting": None, "pending": total}
+        for i, (run_id, run_dir) in enumerate(runs):
             sig = _signature(run_dir)
             cache_run_dir = os.path.join(self.cache_dir, run_id)
             has_cache = os.path.exists(os.path.join(cache_run_dir, "index.json"))
             if has_cache and self._sigs.get(run_id) == sig:
+                self.progress.update(done=i + 1, pending=total - (i + 1))
                 continue  # nothing changed since last successful pass
+            self.progress.update(converting=run_id)
             try:
                 res = convert_run(run_dir, cache_run_dir, run_id, n_jobs=self.jobs)
                 self._sigs[run_id] = sig
@@ -93,10 +101,11 @@ class Watcher:
             except Exception:
                 errors += 1
                 traceback.print_exc()
+            self.progress.update(done=i + 1, converting=None, pending=total - (i + 1))
         self.last_scan = {
             "at": time.time(),
             "converted": converted,
-            "runs": len(runs),
+            "runs": total,
             "errors": errors,
         }
         return self.last_scan

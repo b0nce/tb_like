@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
-from .convert import load_index, load_meta
+from .convert import load_index, load_meta, load_texts
 from .downsample import lttb
 
 
@@ -34,6 +34,7 @@ class Store:
     def __init__(self, cache_dir: str):
         self.cache_dir = cache_dir
         self._index_cache: dict[str, tuple[float, dict]] = {}  # run_id -> (mtime, index)
+        self._texts_cache: dict[str, tuple[float, dict]] = {}  # run_id -> (mtime, texts)
 
     # ---- discovery -------------------------------------------------------
     def run_ids(self) -> list[str]:
@@ -179,3 +180,42 @@ class Store:
             for fut in futures:  # preserve run order
                 out.extend(fut.result())
         return out
+
+    # ---- text summaries (for the config diff) ----------------------------
+    def _texts(self, run_id: str) -> dict:
+        p = os.path.join(self.cache_dir, run_id, "texts.json")
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            self._texts_cache.pop(run_id, None)
+            return {}
+        cached = self._texts_cache.get(run_id)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        texts = load_texts(os.path.join(self.cache_dir, run_id))
+        self._texts_cache[run_id] = (mtime, texts)
+        return texts
+
+    def text_index(self, run_ids: list[str]) -> dict:
+        """Available text entries per run, WITHOUT the bodies:
+        {run_id: {display_name, tags: {tag: [{step, wall_time, chars}]}}}."""
+        out: dict = {}
+        for rid in run_ids:
+            texts = self._texts(rid)
+            if not texts:
+                continue
+            idx = self._index(rid) or {}
+            tag_map = {}
+            for tag, by_step in texts.items():
+                entries = [
+                    {"step": int(s), "wall_time": e.get("wall_time", 0.0), "chars": len(e.get("text", ""))}
+                    for s, e in by_step.items()
+                ]
+                entries.sort(key=lambda x: x["step"])
+                tag_map[tag] = entries
+            out[rid] = {"display_name": idx.get("display_name", rid), "tags": tag_map}
+        return out
+
+    def get_text(self, run_id: str, tag: str, step: int) -> str | None:
+        entry = self._texts(run_id).get(tag, {}).get(str(step))
+        return entry.get("text") if entry else None

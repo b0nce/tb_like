@@ -76,6 +76,22 @@ def load_index(cache_run_dir: str) -> dict | None:
         return None
 
 
+def _load_texts(cache_run_dir: str) -> dict:
+    p = os.path.join(cache_run_dir, "texts.json")
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_texts(cache_run_dir: str) -> dict:
+    """Public read of a run's text summaries: {tag: {step: {wall_time, text}}}."""
+    return _load_texts(cache_run_dir)
+
+
 def load_meta(cache_run_dir: str) -> dict | None:
     """Read the small per-run meta.json, lazily creating it from index.json
     for caches written before the split (one-time, cheap thereafter)."""
@@ -99,7 +115,7 @@ def load_meta(cache_run_dir: str) -> dict | None:
 
 # Keys surfaced in the lightweight per-run meta.json (read for run listing, so
 # the dashboard never has to parse the multi-MB tags map just to show the list).
-META_KEYS = ("run_id", "display_name", "num_rows", "num_event_files", "updated_at", "config")
+META_KEYS = ("run_id", "display_name", "num_rows", "num_event_files", "updated_at", "config", "text_tags")
 
 
 def meta_from_index(index: dict) -> dict:
@@ -181,10 +197,13 @@ def convert_run(
     # Parse files (parallel or sequential), streaming results as they complete
     # so the progress bar tracks real progress. Each result is one columnar chunk.
     frames: list[pl.DataFrame] = []
+    new_texts: list[tuple] = []  # (tag, step, wall_time, text) from text summaries
 
     def handle(res: dict) -> None:
         nonlocal done
         state.files[res["name"]] = FileState(size=res["size"], records=res["records"])
+        if res.get("texts"):
+            new_texts.extend(res["texts"])
         if res["steps"]:
             frames.append(
                 pl.DataFrame(
@@ -234,6 +253,14 @@ def convert_run(
         segments.append(segment_name)
         tags = _merge_tag_stats(tags, df)
 
+    # Text summaries (e.g. the logged config) live in a small sidecar, keyed by
+    # tag -> step. Merged across passes, last write wins.
+    texts = _load_texts(cache_run_dir)
+    for tag, step, wall, text in new_texts:
+        texts.setdefault(tag, {})[str(step)] = {"wall_time": wall, "text": text}
+    if new_texts:
+        _atomic_write_json(os.path.join(cache_run_dir, "texts.json"), texts)
+
     # Metadata is (re)read cheaply each pass so config edits are picked up.
     config = _shallow_yaml(os.path.join(run_dir, "config.yaml"))
     meta_name = display_name or index.get("display_name") or config.get("run_name") or run_id
@@ -250,6 +277,7 @@ def convert_run(
             "ingest": state.to_dict(),
             "num_rows": total_rows,
             "num_event_files": len(list_event_files(run_dir)),
+            "text_tags": sorted(texts.keys()),
             "updated_at": time.time(),
         }
     )

@@ -61,6 +61,12 @@ the cache in sync, and serves them — no separate build step. The cache lives i
   x-axis, and **outlier clipping** by value percentiles.
 - Collapsible per-group chart sections, resizable sidebar, and a one-click
   **Refresh selected** that re-ingests from disk and rebuilds the plots.
+- **Text diff** panel (pinned at the bottom): compare logged text summaries —
+  typically the run config — between any two runs/steps as a git-style diff.
+
+> Text summaries are ingested as event files are parsed. To enable the text
+> diff for runs converted by an older version, clear their cache
+> (`<runs_dir>/.tblike_cache`) so they re-ingest; new runs get it automatically.
 
 ## CLI
 

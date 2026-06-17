@@ -133,6 +133,7 @@ def parse_file(path: str, already: int = 0) -> dict:
     steps: list[int] = []
     walls: list[float] = []
     vals: list[float] = []
+    texts: list[tuple[str, int, float, str]] = []  # (tag, step, wall_time, text)
     seen = 0
     for ev in EventFileLoader(path).Load():
         seen += 1
@@ -142,12 +143,15 @@ def parse_file(path: str, already: int = 0) -> dict:
             continue
         for v in ev.summary.value:
             val = _decode_scalar(v)
-            if val is None:
+            if val is not None:
+                tags.append(v.tag)
+                steps.append(int(ev.step))
+                walls.append(float(ev.wall_time))
+                vals.append(val)
                 continue
-            tags.append(v.tag)
-            steps.append(int(ev.step))
-            walls.append(float(ev.wall_time))
-            vals.append(val)
+            txt = _decode_text(v)
+            if txt is not None:
+                texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -160,6 +164,7 @@ def parse_file(path: str, already: int = 0) -> dict:
         "steps": steps,
         "walls": walls,
         "vals": vals,
+        "texts": texts,
     }
 
 

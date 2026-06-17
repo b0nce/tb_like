@@ -67,6 +67,20 @@ def create_app(
             raise HTTPException(400, "max_points out of range")
         return {"series": store.get_series(req.run_ids, req.tags, req.max_points)}
 
+    @app.get("/api/text-index")
+    def get_text_index(runs: str = ""):
+        run_ids = [r for r in runs.split(",") if r]
+        if not run_ids:
+            return {"runs": {}}
+        return {"runs": store.text_index(run_ids)}
+
+    @app.get("/api/text")
+    def get_text(run: str, tag: str, step: int):
+        text = store.get_text(run, tag, step)
+        if text is None:
+            raise HTTPException(404, "text not found")
+        return {"run": run, "tag": tag, "step": step, "text": text}
+
     @app.post("/api/refresh")
     def post_refresh(req: RefreshRequest):
         # Re-ingest selected runs from disk now (incremental: a fast no-op if no
@@ -88,6 +102,7 @@ def create_app(
     def get_status():
         return {
             "watcher": watcher.last_scan,
+            "progress": watcher.progress,
             "num_runs": len(store.run_ids()),
         }
 

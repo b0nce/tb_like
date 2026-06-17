@@ -186,6 +186,37 @@ main {
 .chart.pending-card, .chart.loading { display: flex; align-items: center; justify-content: center; min-height: 200px; }
 .chart .chart-spinner { color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 8px; max-width: 90%; }
 .chart .chart-spinner .cap { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+/* text-diff panel (always the last block in the charts area) */
+.diffpanel { grid-column: 1 / -1; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-top: 8px; }
+.diff-head {
+  padding: 10px 12px; cursor: pointer; user-select: none; font-weight: 600;
+  color: var(--accent); display: flex; align-items: center; gap: 8px;
+}
+.diff-head:hover { color: #cfe4ff; }
+.diff-head .dcaret { font-size: 10px; }
+.diff-head .dhint { color: var(--muted); font-weight: normal; font-size: 11px; }
+.diffpanel.collapsed .diff-body { display: none; }
+.diff-body { padding: 0 12px 12px; }
+.diff-selectors { display: flex; gap: 14px; margin-bottom: 10px; flex-wrap: wrap; }
+.diff-side { flex: 1; min-width: 280px; display: flex; gap: 6px; align-items: center; }
+.diff-side .sidetag { font-weight: 700; }
+.diff-side.a .sidetag { color: #f2545b; }
+.diff-side.b .sidetag { color: #3dd68c; }
+.diff-side select { flex: 1; min-width: 0; margin: 0; }
+.diff-summary { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.diff-summary .add { color: #3dd68c; } .diff-summary .del { color: #f2545b; }
+.diff-view {
+  max-height: 60vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117;
+}
+.diff-view .dl { display: flex; white-space: pre-wrap; }
+.diff-view .dl .gut { flex: 0 0 16px; text-align: center; color: var(--muted); user-select: none; }
+.diff-view .dl .txt { flex: 1; padding-right: 8px; }
+.diff-view .dl.add { background: rgba(61,214,140,.13); } .diff-view .dl.add .gut { color: #3dd68c; }
+.diff-view .dl.del { background: rgba(242,84,91,.13); }  .diff-view .dl.del .gut { color: #f2545b; }
+.diff-view .dl.same .txt { color: var(--muted); }
+.diff-empty { padding: 14px; color: var(--muted); }
+
 .chart .chart-spinner .ring {
   width: 22px; height: 22px; border: 3px solid var(--border);
   border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite;
