@@ -12,6 +12,7 @@ const state = {
   lastFilter: undefined,    // last tag-filter value (to auto-expand matches once)
   loadedTagCounts: new Set(), // num_tags values whose tag set is already loaded
   collapsedGroups: new Set(), // top-level chart groups the user has collapsed
+  showSelectedOnly: false,    // tree shows only currently-selected tags
   stepBounds: { min: null, max: null },  // global [min,max] step across loaded tags
   stepRange: { lo: null, hi: null },     // user-chosen window (null = at the edge)
 };
@@ -320,13 +321,15 @@ function renderTagTree() {
   const match = makeTagMatcher(filter);
   let names = Object.keys(state.tags);
   if (match) names = names.filter(match);
+  if (state.showSelectedOnly) names = names.filter((t) => state.selectedTags.has(t));
   const root = buildTagTree(names);
 
-  // When the filter *changes*, auto-expand the groups leading to matches so
-  // results are visible — but only once, so manual expand/collapse still works.
-  if (filter !== state.lastFilter) {
-    state.lastFilter = filter;
-    if (filter) {
+  // When the filter or selected-only mode *changes*, auto-expand the groups
+  // leading to the shown tags — but only once, so manual expand/collapse sticks.
+  const fkey = filter + " " + (state.showSelectedOnly ? "S" : "");
+  if (fkey !== state.lastFilter) {
+    state.lastFilter = fkey;
+    if (filter || state.showSelectedOnly) {
       const addPaths = (node) => {
         for (const c of node.children.values()) {
           if (c.children.size) { state.expanded.add(c.path); addPaths(c); }
@@ -372,6 +375,7 @@ function renderTagTree() {
         cb.onchange = () => {
           cb.checked ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
           updatePending(); scheduleGrid();
+          if (state.showSelectedOnly) renderTagTree();  // drop it from the list
         };
       }
 
@@ -416,7 +420,8 @@ function renderTagTree() {
   renderChildren(root, 0);
 
   const total = Object.keys(state.tags).length;
-  $("tag-count").textContent = filter ? `(${names.length}/${total})` : `(${total})`;
+  $("tag-count").textContent = (filter || state.showSelectedOnly)
+    ? `(${names.length}/${total})` : `(${total})`;
 }
 
 // ---- smoothing (TensorBoard-style EMA with debias) -------------------------
@@ -861,6 +866,36 @@ async function ensureChart(card) {
   }
 }
 
+// Distinct markers at each break in a line, so a gap is explained: NaN, +Inf or
+// −Inf. Each marker sits at the nearest finite value (the break point), keyed by
+// the server-supplied gap list.
+// Distinct symbol per break kind; fill is the RUN color (so you can tell which
+// run) and a light halo lifts it off the line. Symbols: ✕ NaN, ▲ +Inf, ▼ −Inf.
+// These MUST be scattergl (not scatter): Plotly draws the WebGL line layer above
+// the SVG layer, so SVG markers would stay buried no matter the order. As gl
+// markers appended after the gl lines, trace order puts them on top.
+const GAP_STYLE = {
+  "nan":  { sym: "x",             label: "NaN",  size: 8 },
+  "+inf": { sym: "triangle-up",   label: "+Inf", size: 9 },
+  "-inf": { sym: "triangle-down", label: "−Inf", size: 9 },
+};
+function addGapMarkers(out, s, xaxis, color) {
+  const win = stepRangeActive();
+  for (const kind of ["nan", "+inf", "-inf"]) {
+    const pts = s.gaps.filter((g) =>
+      g.kind === kind && (!win || (g.step >= win[0] && g.step <= win[1])));
+    if (!pts.length) continue;
+    const st = GAP_STYLE[kind];
+    const gx = pts.map((g) => xaxis === "wall_time" ? (g.wall_time - s.wall_time[0]) / 60.0 : g.step);
+    out.push({
+      x: gx, y: pts.map((g) => g.y), type: "scattergl", mode: "markers",
+      marker: { symbol: st.sym, size: st.size, color, line: { width: 1.5, color: "#f5f7fa" } },
+      name: st.label, showlegend: false, hoverinfo: "text",
+      text: pts.map((g) => `${st.label} · ${s.display_name} · step ${g.step}`),
+    });
+  }
+}
+
 function drawCard(card, series) {
   const tag = card.dataset.tag;
   card.classList.remove("loading", "pending-card");
@@ -871,6 +906,7 @@ function drawCard(card, series) {
   const view = stepLimited(series);
   const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
   const traces = [];
+  const gapTraces = [];   // appended last so the markers sit on top of every line
   for (const s of view) {
     const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
     const color = colorFor(s.run_id);
@@ -883,7 +919,9 @@ function drawCard(card, series) {
       traces.push({ x, y: s.values, type: "scattergl", mode: "lines",
         line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     }
+    if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color);
   }
+  traces.push(...gapTraces);   // markers drawn after (over) all the lines
   // Outlier clip sets an explicit y-range from value percentiles (of the window).
   const clip = optOutliers() ? outlierRange(view, logy) : null;
   const yaxis = { type: logy ? "log" : "linear", gridcolor: "#2a313c", zeroline: false };
@@ -1040,6 +1078,11 @@ $("tags-expand").onclick = () => {
     const top = t.split("/")[0];
     if (t.includes("/")) state.expanded.add(top);
   }
+  renderTagTree();
+};
+$("tags-selected").onclick = () => {
+  state.showSelectedOnly = !state.showSelectedOnly;
+  $("tags-selected").classList.toggle("active", state.showSelectedOnly);
   renderTagTree();
 };
 $("tags-collapse").onclick = () => { state.expanded.clear(); renderTagTree(); };

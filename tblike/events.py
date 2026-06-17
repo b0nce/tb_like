@@ -12,15 +12,56 @@ many records we have already consumed, so a re-scan only emits new data.
 from __future__ import annotations
 
 import glob
+import mmap
 import os
+import struct
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
-from tensorboard.compat.proto import types_pb2
+from google.protobuf.message import DecodeError
+from tensorboard.compat.proto import event_pb2, types_pb2
 from tensorboard.util import tensor_util
 
 EVENT_GLOB = "events.out.tfevents.*"
+
+_Event = event_pb2.Event
+
+
+def iter_event_records(path: str) -> Iterator[bytes]:
+    """Yield raw Event-proto payloads from a TFRecord event file.
+
+    TensorBoard's own ``EventFileLoader`` is ~25x slower here — it does Python-
+    level reads and CRC checks per record. The TFRecord framing is just
+    ``len(u64) | crc(u32) | data | crc(u32)``, so we mmap the file and slice by
+    the length prefix. CRCs are skipped; a truncated tail (file still being
+    written) or a bad length simply stops iteration cleanly.
+    """
+    with open(path, "rb") as fh:
+        try:
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except ValueError:
+            return  # empty file
+        try:
+            n = len(mm)
+            i = 0
+            while i + 12 <= n:
+                length = struct.unpack_from("<Q", mm, i)[0]
+                start = i + 12               # skip length(8) + its crc(4)
+                end = start + length
+                if end + 4 > n:
+                    break                    # truncated / partially written record
+                yield mm[start:end]
+                i = end + 4                  # skip data + its crc(4)
+        finally:
+            mm.close()
+
+
+def _event_from_bytes(data: bytes):
+    """Parse one Event proto; return None on corruption (treat as end-of-stream)."""
+    try:
+        return _Event.FromString(data)
+    except (DecodeError, ValueError):
+        return None
 
 # DataType enum values for the float/int tensors we accept as scalars.
 _NUMERIC_DTYPES = frozenset(
@@ -135,10 +176,13 @@ def parse_file(path: str, already: int = 0) -> dict:
     vals: list[float] = []
     texts: list[tuple[str, int, float, str]] = []  # (tag, step, wall_time, text)
     seen = 0
-    for ev in EventFileLoader(path).Load():
+    for data in iter_event_records(path):
         seen += 1
         if seen <= already:
             continue
+        ev = _event_from_bytes(data)
+        if ev is None:
+            break  # corruption -> stop (next pass re-reads from `already`)
         if not ev.HasField("summary"):
             continue
         for v in ev.summary.value:
@@ -185,8 +229,11 @@ def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
     texts: list[tuple[str, int, float, str]] = []
     seen = since = 0
     found = False
-    for ev in EventFileLoader(path).Load():
+    for data in iter_event_records(path):
         seen += 1
+        ev = _event_from_bytes(data)
+        if ev is None:
+            break
         got = False
         if ev.HasField("summary"):
             for v in ev.summary.value:
@@ -236,10 +283,13 @@ def iter_new_scalars(run_dir: str, state: RunIngestState, on_file=None) -> Itera
 
         already = fs.records if fs is not None else 0
         seen = 0
-        for ev in EventFileLoader(path).Load():
+        for data in iter_event_records(path):
             seen += 1
             if seen <= already:
                 continue
+            ev = _event_from_bytes(data)
+            if ev is None:
+                break
             if not ev.HasField("summary"):
                 continue
             for v in ev.summary.value:

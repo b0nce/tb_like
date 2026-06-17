@@ -13,15 +13,18 @@ import numpy as np
 def lttb(x: np.ndarray, y: np.ndarray, n_out: int) -> tuple[np.ndarray, np.ndarray]:
     """Downsample (x, y) to about `n_out` points using LTTB.
 
-    `x` is assumed sorted ascending. NaNs in `y` are treated as 0 for area
-    computation but their original value is preserved in the output.
+    `x` is assumed sorted ascending. Non-finite y (NaN/±Inf) are treated as 0
+    for the area computation but their original value is preserved in the output
+    (the read layer turns non-finite into nulls/gaps).
     """
     n = len(x)
     if n_out >= n or n_out < 3:
         return x, y
 
     x = x.astype(np.float64, copy=False)
-    yf = np.nan_to_num(y.astype(np.float64, copy=False), nan=0.0)
+    # Neutralize non-finite for area math so Inf can't overflow/dominate bucket
+    # selection; the original y (incl. NaN/Inf) is what we return.
+    yf = np.nan_to_num(y.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
 
     sampled_idx = np.empty(n_out, dtype=np.int64)
     sampled_idx[0] = 0

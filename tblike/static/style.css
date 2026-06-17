@@ -81,6 +81,7 @@ body.dragging { cursor: col-resize; user-select: none; }
   border-radius: 5px; padding: 2px 8px; cursor: pointer; font-size: 11px;
 }
 .row-actions button:hover { border-color: var(--accent); }
+.row-actions button.active { color: var(--accent); border-color: var(--accent); background: #1b2735; }
 input[type="search"], input[type="number"], select {
   width: 100%; margin: 6px 0; padding: 6px 8px;
   background: var(--panel2); color: var(--text);

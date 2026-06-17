@@ -19,6 +19,42 @@ from .convert import load_index, load_meta, load_texts
 from .downsample import lttb
 
 
+# Cap how many non-finite markers we emit per series, so a pathologically broken
+# series (mostly NaN/Inf) can't bloat the payload.
+GAP_CAP = 2000
+
+
+def _nonfinite_gaps(steps: np.ndarray, values: np.ndarray, walls: np.ndarray) -> list[dict]:
+    """Describe each non-finite point: {step, wall_time, kind, y}.
+
+    `kind` is "nan" / "+inf" / "-inf". `y` anchors the marker to the nearest
+    finite value (previous if any, else next) so it sits right at the break.
+    """
+    finite = np.isfinite(values)
+    bad = np.flatnonzero(~finite)
+    if bad.size == 0:
+        return []
+    fin = np.flatnonzero(finite)
+    if fin.size:
+        # nearest finite index: previous one, falling back to the first finite
+        pos = np.searchsorted(fin, bad, side="right") - 1
+        anchor_idx = np.where(pos >= 0, fin[np.clip(pos, 0, fin.size - 1)], fin[0])
+        anchors = values[anchor_idx]
+    else:
+        anchors = np.zeros(bad.size)
+    out: list[dict] = []
+    for i, ai in zip(bad[:GAP_CAP], anchors[:GAP_CAP]):
+        v = values[i]
+        kind = "nan" if np.isnan(v) else ("+inf" if v > 0 else "-inf")
+        out.append({
+            "step": int(steps[i]),
+            "wall_time": float(walls[i]),
+            "kind": kind,
+            "y": float(ai),
+        })
+    return out
+
+
 @dataclass
 class RunInfo:
     run_id: str
@@ -140,6 +176,10 @@ class Store:
             values = sub["value"].to_numpy().astype(np.float64)
             walls = sub["wall_time"].to_numpy()
             count = len(steps)
+            # Locate non-finite points on the FULL series (so downsampling can't
+            # hide them) and tag each with its kind + an anchor y (nearest finite
+            # value) so the UI can mark exactly where — and why — the line breaks.
+            gaps = _nonfinite_gaps(steps, values, walls)
             if max_points and count > max_points:
                 ds, vs = lttb(steps.astype(np.float64), values, max_points)
                 # Map downsampled steps back to nearest wall_time for x-axis options.
@@ -147,17 +187,21 @@ class Store:
                 steps_out, values_out, walls_out = ds.astype(np.int64), vs, wsel
             else:
                 steps_out, values_out, walls_out = steps, values, walls
-            items.append(
-                {
-                    "run_id": rid,
-                    "display_name": display,
-                    "tag": tag_name,
-                    "steps": steps_out.tolist(),
-                    "values": [None if np.isnan(v) else float(v) for v in values_out],
-                    "wall_time": walls_out.tolist(),
-                    "count": int(count),
-                }
-            )
+            item = {
+                "run_id": rid,
+                "display_name": display,
+                "tag": tag_name,
+                "steps": steps_out.tolist(),
+                # Non-finite (NaN or ±Inf) -> null: Plotly draws a gap, and it
+                # keeps Inf out of JSON (Starlette uses allow_nan=False) and off
+                # the y-axis autoscale.
+                "values": [None if not np.isfinite(v) else float(v) for v in values_out],
+                "wall_time": walls_out.tolist(),
+                "count": int(count),
+            }
+            if gaps:
+                item["gaps"] = gaps
+            items.append(item)
         return items
 
     def get_series(
