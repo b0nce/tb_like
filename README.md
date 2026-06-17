@@ -64,9 +64,11 @@ the cache in sync, and serves them — no separate build step. The cache lives i
 - **Text diff** panel (pinned at the bottom): compare logged text summaries —
   typically the run config — between any two runs/steps as a git-style diff.
 
-> Text summaries are ingested as event files are parsed. To enable the text
-> diff for runs converted by an older version, clear their cache
-> (`<runs_dir>/.tblike_cache`) so they re-ingest; new runs get it automatically.
+> Text summaries are ingested as event files are parsed, so new runs get them
+> automatically. For runs converted by an older version (before text support),
+> attach text without re-parsing scalars by running
+> `tblike backfill-text <runs_dir>` — or just hit **Refresh selected** in the UI,
+> which backfills any selected run that's missing text.
 
 ## CLI
 
@@ -80,6 +82,7 @@ Advanced / scriptable subcommands:
 ```
 tblike convert RUN_DIR [RUN_ID] [-j JOBS]   # ingest one run into Parquet (one-off)
 tblike scan                                 # one incremental ingest pass, no server
+tblike backfill-text RUNS_DIR [-j JOBS]     # attach text (configs) to old caches
 ```
 
 ## How it stores data

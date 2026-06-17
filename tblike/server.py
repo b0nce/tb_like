@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .convert import convert_run
+from .convert import backfill_texts, convert_run
 from .store import Store
 from .watcher import Watcher
 
@@ -85,18 +85,26 @@ def create_app(
     def post_refresh(req: RefreshRequest):
         # Re-ingest selected runs from disk now (incremental: a fast no-op if no
         # new tfevents). Sync endpoint -> runs in the threadpool, off the loop.
-        refreshed, new_rows = [], 0
+        refreshed, new_rows, text_added = [], 0, 0
         for rid in req.run_ids:
             run_dir = os.path.join(runs_dir, rid)
             if not os.path.isdir(run_dir):
                 continue
+            cache_run_dir = os.path.join(cache_dir, rid)
             try:
-                res = convert_run(run_dir, os.path.join(cache_dir, rid), rid)
+                res = convert_run(run_dir, cache_run_dir, rid)
+                # Backfill text for runs ingested before text support (a cheap
+                # no-op once they already have text). jobs= speeds the re-scan.
+                n = backfill_texts(run_dir, cache_run_dir, n_jobs=jobs)
+                if n > 0:
+                    text_added += 1
+                # Store caches index/texts by mtime, so the rewritten files are
+                # picked up automatically on the next read — no manual invalidation.
                 refreshed.append(rid)
                 new_rows += res.new_rows
             except Exception as e:  # noqa: BLE001 - report, don't crash the request
                 raise HTTPException(500, f"refresh failed for {rid}: {e}")
-        return {"refreshed": refreshed, "new_rows": new_rows}
+        return {"refreshed": refreshed, "new_rows": new_rows, "text_backfilled": text_added}
 
     @app.get("/api/status")
     def get_status():

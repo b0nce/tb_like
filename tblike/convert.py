@@ -22,7 +22,14 @@ from dataclasses import dataclass
 
 import polars as pl
 
-from .events import FileState, RunIngestState, list_event_files, parse_file, plan_files
+from .events import (
+    FileState,
+    RunIngestState,
+    list_event_files,
+    parse_file,
+    parse_texts,
+    plan_files,
+)
 
 ROW_GROUP_SIZE = 256_000
 
@@ -164,6 +171,60 @@ def _merge_tag_stats(existing: dict, df: pl.DataFrame) -> dict:
             cur["max_step"] = max(cur["max_step"], row["max_step"])
             cur["last_value"] = row["last_value"]
     return existing
+
+
+def backfill_texts(
+    run_dir: str,
+    cache_run_dir: str,
+    on_file=None,
+    n_jobs: int = 1,
+    force: bool = False,
+) -> int:
+    """Re-scan a run's event files for text summaries and merge into texts.json.
+
+    Unlike :func:`convert_run`, this ignores per-file ingest state, so it
+    backfills text for runs converted before text support existed — without
+    re-parsing scalars or rewriting Parquet. Idempotent (last write wins).
+
+    Returns the number of (tag, step) texts now stored, or ``-1`` if the run
+    already had text and ``force`` was not set (skipped as a cheap no-op).
+    """
+    if load_index(cache_run_dir) is None:
+        return -1  # nothing converted here yet; nothing to attach text to
+    texts = _load_texts(cache_run_dir)
+    if texts and not force:
+        return -1  # already has text — skip the full re-scan
+
+    files = list_event_files(run_dir)
+    total = len(files)
+    done = 0
+
+    def handle(res: dict) -> None:
+        nonlocal done
+        for tag, step, wall, text in res["texts"]:
+            texts.setdefault(tag, {})[str(step)] = {"wall_time": wall, "text": text}
+        done += 1
+        if on_file:
+            on_file(done, total, res["name"])
+
+    if n_jobs == 1:
+        for path in files:
+            handle(parse_texts(path))
+    else:
+        from joblib import Parallel, delayed
+
+        gen = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
+            delayed(parse_texts)(path) for path in files
+        )
+        for res in gen:
+            handle(res)
+
+    _atomic_write_json(os.path.join(cache_run_dir, "texts.json"), texts)
+    index = load_index(cache_run_dir)
+    if index is not None:
+        index["text_tags"] = sorted(texts.keys())
+        _write_index(cache_run_dir, index)
+    return sum(len(v) for v in texts.values())
 
 
 def convert_run(

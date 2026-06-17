@@ -168,6 +168,25 @@ def parse_file(path: str, already: int = 0) -> dict:
     }
 
 
+def parse_texts(path: str) -> dict:
+    """Scan one event file for text summaries only (e.g. a logged config).
+
+    Top-level/picklable for joblib. Ignores ingest state and scalars entirely,
+    so it can backfill text for runs ingested before text support existed
+    without re-parsing or rewriting their Parquet. Returns
+    ``{"name", "texts": [(tag, step, wall_time, text), ...]}``.
+    """
+    texts: list[tuple[str, int, float, str]] = []
+    for ev in EventFileLoader(path).Load():
+        if not ev.HasField("summary"):
+            continue
+        for v in ev.summary.value:
+            txt = _decode_text(v)
+            if txt is not None:
+                texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
+    return {"name": os.path.basename(path), "texts": texts}
+
+
 def iter_new_scalars(run_dir: str, state: RunIngestState, on_file=None) -> Iterator[ScalarRow]:
     """Yield scalar rows that have NOT been ingested yet, updating `state`.
 

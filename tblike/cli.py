@@ -22,7 +22,7 @@ import shutil
 import sys
 import time
 
-from .convert import convert_run, load_index, meta_from_index
+from .convert import backfill_texts, convert_run, load_index, load_texts, meta_from_index
 from .watcher import Watcher, discover_runs
 
 
@@ -110,6 +110,35 @@ def cmd_clone(args: argparse.Namespace) -> None:
     print(f"cloned {args.src_run_id} -> {args.count} runs ({len(segments)} segments each)")
 
 
+def cmd_backfill_text(args: argparse.Namespace) -> None:
+    """Re-scan event files for text summaries (e.g. configs) and attach them to
+    existing caches. For runs ingested before text support: scalars/Parquet are
+    left untouched, so this is much cheaper than clearing and re-converting."""
+    runs = discover_runs(args.runs_dir)
+    if not runs:
+        print(f"no runs found under {args.runs_dir}", file=sys.stderr)
+        sys.exit(1)
+    # Cache defaults to the serve convention: <runs_dir>/.tblike_cache.
+    cache_dir = args.cache_dir or os.path.join(args.runs_dir, ".tblike_cache")
+    print(f"backfilling text from {args.runs_dir} into {cache_dir} ({args.jobs} jobs)")
+    done = skipped = 0
+    for run_id, run_dir in runs:
+        cache_run_dir = os.path.join(cache_dir, run_id)
+        n = backfill_texts(
+            run_dir, cache_run_dir,
+            on_file=_file_progress(run_id), n_jobs=args.jobs, force=args.force,
+        )
+        if n < 0:
+            skipped += 1
+            reason = "no cache" if load_index(cache_run_dir) is None else "already has text"
+            print(f"[{run_id}] skipped ({reason}; use --force to re-scan)")
+        else:
+            done += 1
+            tags = sorted(load_texts(cache_run_dir).keys())
+            print(f"[{run_id}] {n} text entries across {len(tags)} tag(s)")
+    print(f"backfilled {done} run(s), skipped {skipped}")
+
+
 def cmd_scan(args: argparse.Namespace) -> None:
     w = Watcher(args.runs_dir, args.cache_dir)
     runs = discover_runs(args.runs_dir)
@@ -168,6 +197,17 @@ def run_advanced(argv: list[str]) -> None:
     s = sub.add_parser("scan", help="one incremental ingest pass, no server")
     s.set_defaults(func=cmd_scan)
 
+    bt = sub.add_parser("backfill-text",
+                        help="attach text summaries (configs) to existing caches")
+    bt.add_argument("runs_dir", help="folder of runs (same one you serve)")
+    bt.add_argument("--cache-dir", default=None,
+                    help="Parquet cache dir (default: <runs_dir>/.tblike_cache)")
+    bt.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS,
+                    help="parallel worker processes for the text re-scan")
+    bt.add_argument("--force", action="store_true",
+                    help="re-scan even runs that already have text")
+    bt.set_defaults(func=cmd_backfill_text)
+
     b = sub.add_parser("build-runs", help="create symlinked test runs (dev)")
     b.add_argument("--source", default="data")
     b.add_argument("--count", type=int, default=200)
@@ -184,7 +224,7 @@ def run_advanced(argv: list[str]) -> None:
     args.func(args)
 
 
-ADVANCED = {"convert", "scan", "build-runs", "clone"}
+ADVANCED = {"convert", "scan", "backfill-text", "build-runs", "clone"}
 
 
 def main(argv: list[str] | None = None) -> None:
