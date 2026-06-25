@@ -8,6 +8,8 @@ const state = {
   selectedTags: new Set(),
   runColor: new Map(),
   expanded: new Set(),      // group paths currently expanded in the tag tree
+  expandedSaved: null,      // manual expansion snapshot, restored when filter clears
+  filtering: false,         // whether a filter / selected-only is currently active
   cards: new Map(),         // tag -> { fetchSig, series, loading } (lazy chart state)
   visible: new Set(),       // tags near the viewport (wide zone) — drives data prefetch
   onscreen: new Set(),      // tags in/near the viewport (narrow zone) — drives rendering
@@ -345,6 +347,14 @@ function makeTagMatcher(raw) {
 // names or rebuilding thousands of DOM rows (which is what made clicking a group
 // checkbox jank violently).
 let _treeRows = [];
+
+// A broad regex filter can match (and auto-expand) tens of thousands of tags;
+// building every row synchronously freezes the tab. Cap the TOTAL rows produced
+// in one render pass — beyond it we stop and show a "refine the filter" note.
+const TREE_RENDER_CAP = 3000;
+let _renderLeft = 0;          // rows still allowed in the current pass
+let _renderTruncated = false; // hit the cap → show the note
+
 function refreshTreeChecks() {
   for (const r of _treeRows) {
     if (r.isGroup) {
@@ -399,7 +409,17 @@ function toggleExpand(node, rowEl) {
   } else {
     state.expanded.add(node.path);
     const frag = document.createDocumentFragment();
+    _renderLeft = TREE_RENDER_CAP;
+    _renderTruncated = false;
     renderTreeChildren(frag, node, depth + 1);
+    if (_renderTruncated) {
+      const more = document.createElement("div");
+      more.className = "tmore";
+      more.style.paddingLeft = 6 + (depth + 1) * 14 + "px";
+      more.dataset.depth = depth + 1;
+      more.textContent = `showing first ${TREE_RENDER_CAP.toLocaleString()} — refine the filter`;
+      frag.appendChild(more);
+    }
     rowEl.after(frag);
     caret.textContent = "▼";
   }
@@ -413,6 +433,8 @@ function renderTreeChildren(container, node, depth) {
   const kids = sortedChildren(node);
   const limited = kids.slice(0, MAX_CHILDREN);
   for (const child of limited) {
+    if (_renderLeft <= 0) { _renderTruncated = true; return; }   // global cap reached
+    _renderLeft--;
     const isGroup = child.children.size > 0;
     const row = document.createElement("div");
     row.className = "tnode " + (isGroup ? "group" : "leaf-row");
@@ -506,12 +528,24 @@ function renderTagTree() {
   const root = buildTagTreeCached(names, key);
   annotateTree(root, null);   // refresh parent pointers + cached selected-counts
 
+  // Filtering auto-expands to reveal matches (mutating state.expanded). Snapshot
+  // the manual expansion on entering filter mode and restore it on leaving, so
+  // clearing the filter doesn't leave the whole tree expanded.
+  const filtering = !!filter || state.showSelectedOnly;
+  if (filtering && !state.filtering) {
+    state.expandedSaved = new Set(state.expanded);
+  } else if (!filtering && state.filtering && state.expandedSaved) {
+    state.expanded = state.expandedSaved;
+    state.expandedSaved = null;
+  }
+  state.filtering = filtering;
+
   // When the filter or selected-only mode *changes*, auto-expand the groups
   // leading to the shown tags — but only once, so manual expand/collapse sticks.
   const fkey = filter + " " + (state.showSelectedOnly ? "S" : "");
   if (fkey !== state.lastFilter) {
     state.lastFilter = fkey;
-    if (filter || state.showSelectedOnly) {
+    if (filtering) {
       const addPaths = (node) => {
         for (const c of node.children.values()) {
           if (c.children.size) { state.expanded.add(c.path); addPaths(c); }
@@ -521,7 +555,16 @@ function renderTagTree() {
     }
   }
 
+  _renderLeft = TREE_RENDER_CAP;
+  _renderTruncated = false;
   renderTreeChildren(list, root, 0);
+  if (_renderTruncated) {
+    const more = document.createElement("div");
+    more.className = "tmore";
+    more.style.paddingLeft = "20px";
+    more.textContent = `showing first ${TREE_RENDER_CAP.toLocaleString()} — refine the filter`;
+    list.appendChild(more);
+  }
 
   const total = state.tagNames.length;
   $("tag-count").textContent = (filter || state.showSelectedOnly)
