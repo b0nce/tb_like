@@ -17,7 +17,12 @@
     })();
   </script>
   <link rel="stylesheet" href="static/style.css" />
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <!-- Self-hosted gl2d bundle (1.9MB) instead of the full CDN build (4.3MB):
+       ships both SVG `scatter` and WebGL `scattergl`, so the hybrid renderer can
+       pick per chart. ~2.3× less to download + parse — the parse cost is what
+       stalls weaker CPUs on cold load, and self-hosting drops the CDN round-trip
+       (and works offline / behind a proxy). -->
+  <script src="static/plotly-gl2d-2.35.2.min.js" charset="utf-8"></script>
 </head>
 <body>
   <div id="loadbar" class="loadbar hidden"></div>

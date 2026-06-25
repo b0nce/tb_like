@@ -1,6 +1,6 @@
 [project]
 name = "tb-like"
-version = "0.2.0"
+version = "0.2.1"
 description = "A faster, columnar TensorBoard-style scalar viewer for many series and many runs."
 readme = "README.md"
 requires-python = ">=3.10"

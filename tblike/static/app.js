@@ -292,11 +292,33 @@ function sortedChildren(node) {
   });
 }
 
+// O(1): reads the cached selected-count maintained by annotateTree + the toggle
+// handlers, instead of rescanning every tag in the subtree on each call (that
+// rescan, run per visible group on every click, was the per-click stall).
 function groupSelectState(node) {
-  let sel = 0;
-  for (const t of node.tags) if (state.selectedTags.has(t)) sel++;
+  const sel = node.sel || 0;
   if (sel === 0) return "none";
   return sel === node.tags.length ? "all" : "some";
+}
+
+// Annotate the freshly-built tree with parent pointers and a `sel` count (how
+// many of a node's tags are currently selected), computed bottom-up in one O(n)
+// pass. After this, toggles update `sel` incrementally (O(depth)) so the tree
+// never rescans the full tag set again until it's structurally rebuilt.
+function annotateTree(node, parent) {
+  node.parent = parent;
+  // A node may be both a tag and a group ("loss" alongside "loss/total"), so its
+  // own tag counts too — matching node.tags, which includes it.
+  let s = node.tag != null && state.selectedTags.has(node.tag) ? 1 : 0;
+  for (const c of node.children.values()) s += annotateTree(c, node);
+  node.sel = s;
+  return s;
+}
+
+// Push a full-subtree selection (group checkbox) into the cached counts.
+function setSubtreeSel(node, on) {
+  node.sel = on ? node.tags.length : 0;
+  for (const c of node.children.values()) setSubtreeSel(c, on);
 }
 
 // Filter input is treated as a case-insensitive regex; if it doesn't compile
@@ -315,11 +337,29 @@ function makeTagMatcher(raw) {
   }
 }
 
+// Registry of the checkbox rows currently in the DOM, so a selection toggle can
+// refresh their checked/indeterminate state IN PLACE — without re-parsing 18k tag
+// names or rebuilding thousands of DOM rows (which is what made clicking a group
+// checkbox jank violently).
+let _treeRows = [];
+function refreshTreeChecks() {
+  for (const r of _treeRows) {
+    if (r.isGroup) {
+      const st = groupSelectState(r.node);
+      r.cb.checked = st === "all";
+      r.cb.indeterminate = st === "some";
+    } else {
+      r.cb.checked = state.selectedTags.has(r.tag);
+    }
+  }
+}
+
 function renderTagTree() {
   hideTip();
   const filter = $("tag-filter").value.trim();
   const list = $("tag-list");
   list.innerHTML = "";
+  _treeRows = [];
 
   const match = makeTagMatcher(filter);
   let names = Object.keys(state.tags);
@@ -328,6 +368,7 @@ function renderTagTree() {
   // out (it stays put) instead of removing it from the list.
   if (state.showSelectedOnly) names = names.filter((t) => state.selectedSnapshot.has(t));
   const root = buildTagTree(names);
+  annotateTree(root, null);   // parent pointers + cached selected-counts (for O(1) toggles)
 
   // When the filter or selected-only mode *changes*, auto-expand the groups
   // leading to the shown tags — but only once, so manual expand/collapse sticks.
@@ -373,13 +414,21 @@ function renderTagTree() {
         cb.onchange = () => {
           const turnOn = !(groupSelectState(child) === "all");
           for (const t of child.tags) turnOn ? state.selectedTags.add(t) : state.selectedTags.delete(t);
-          renderTagTree(); updatePending(); scheduleGrid();
+          // Maintain cached counts: set the whole subtree, then fold the net
+          // delta into the ancestors. Keeps every later toggle O(depth).
+          const delta = (turnOn ? child.tags.length : 0) - (child.sel || 0);
+          setSubtreeSel(child, turnOn);
+          for (let n = child.parent; n; n = n.parent) n.sel = (n.sel || 0) + delta;
+          refreshTreeChecks(); updatePending(); scheduleGrid();   // update checks in place — no tree rebuild
         };
       } else {
         cb.checked = state.selectedTags.has(child.tag);
         cb.onchange = () => {
-          cb.checked ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
-          updatePending(); scheduleGrid();   // in selected mode the row stays (snapshot), just toggles
+          const on = cb.checked;
+          on ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
+          const d = on ? 1 : -1;   // bubble the single change up to every ancestor
+          for (let n = child; n; n = n.parent) n.sel = (n.sel || 0) + d;
+          refreshTreeChecks(); updatePending(); scheduleGrid();   // refresh ancestor group states too
         };
       }
 
@@ -409,6 +458,7 @@ function renderTagTree() {
         label.onclick = toggle;
       }
       list.appendChild(row);
+      _treeRows.push({ row, cb, isGroup, node: child, tag: child.tag });
       rendered++;
 
       if (isGroup && expanded) renderChildren(child, depth + 1);
@@ -565,15 +615,44 @@ function outlierRange(series, logy) {
 const fetchSig = () =>
   JSON.stringify([[...state.selectedRuns].sort(), optMaxPoints(), optXaxis()]);
 
-// Two zones, because rendering a scattergl chart is far costlier than fetching
-// its data. The WIDE zone (state.visible) prefetches series over the network so
-// data is ready well ahead of scroll — dozens of charts stay cached and redraw
+// Two zones, because rendering a chart is far costlier than fetching its data.
+// The WIDE zone (state.visible) prefetches series over the network so data is
+// ready well ahead of scroll — dozens of charts stay cached and redraw
 // instantly. The NARROW zone (state.onscreen) decides which charts actually get
-// a (WebGL-backed) plot. Each scattergl plot holds a WebGL context and browsers
-// hard-cap these at ~16 (Chrome) — exceed it and the oldest are silently killed,
-// leaving the "broken image" tiles. So we render at most MAX_LIVE_PLOTS (the
-// browser-safe ceiling) and purge the rest, redrawing from cache on return.
-const MAX_LIVE_PLOTS = 16;
+// drawn.
+//
+// Hybrid SVG/WebGL: data is downsampled server-side (≤max_points), so most
+// charts render fine as SVG `scatter` — which holds NO WebGL context and so can
+// never produce the "broken image" tiles that come from context exhaustion. We
+// only escalate a card to `scattergl` when it carries enough points that SVG
+// would actually drag (GL_POINT_THRESHOLD).
+//
+// Two distinct caps:
+//  • MAX_RENDERED  — total charts drawn at once (SVG + GL). The cheap SVG default
+//    lets this run high, so lots of plots stay live and redraw-free as you scroll.
+//  • MAX_LIVE_PLOTS — of those, how many may be WebGL. Browsers hard-cap WebGL
+//    contexts at ~16 (Chrome); 64 of *those* is physically impossible and would
+//    bring back the broken tiles, so GL stays rationed to the browser-safe count.
+const GL_POINT_THRESHOLD = 6000;   // total plotted points above which a card uses WebGL
+const MAX_RENDERED = 64;           // total live charts (mostly cheap SVG)
+
+// Live WebGL-context budget, scaled to the machine. Weak/integrated GPUs choke
+// well before Chrome's ~16 ceiling, so modest devices get fewer. Computed once.
+const MAX_LIVE_PLOTS = (() => {
+  const cores = navigator.hardwareConcurrency || 4;
+  const mem = navigator.deviceMemory || 4;          // GB, coarse & privacy-rounded
+  if (cores <= 4 || mem <= 4) return 6;
+  if (cores <= 8 || mem <= 8) return 10;
+  return 16;
+})();
+
+// A card needs WebGL only if it plots enough points that SVG would lag. Smoothing
+// draws a second (raw) line, so the visible point count roughly doubles.
+function seriesPointTotal(series, smoothOn) {
+  let n = 0;
+  for (const s of series) n += s.values.length;
+  return smoothOn ? n * 2 : n;
+}
 
 const observer = new IntersectionObserver(   // wide: prefetch data (cheap, no WebGL)
   (entries) => {
@@ -583,7 +662,7 @@ const observer = new IntersectionObserver(   // wide: prefetch data (cheap, no W
     }
     pump();
   },
-  { root: null, rootMargin: "2400px 0px", threshold: 0 }   // ~32+ charts kept cached
+  { root: null, rootMargin: "6500px 0px", threshold: 0 }   // prefetch data well ahead of the render zone
 );
 
 const renderObserver = new IntersectionObserver(   // narrow: render/purge plots
@@ -594,7 +673,7 @@ const renderObserver = new IntersectionObserver(   // narrow: render/purge plots
     }
     renderOnscreen();
   },
-  { root: null, rootMargin: "450px 0px", threshold: 0 }   // ~enough to fill the live cap
+  { root: null, rootMargin: "4500px 0px", threshold: 0 }   // ~enough rows to fill MAX_RENDERED
 );
 
 // ---- priority fetch scheduler ----------------------------------------------
@@ -602,6 +681,18 @@ const MAX_CONCURRENT = 5;   // simultaneous /api/series requests
 let inflight = 0;
 let scrollDir = 1;          // +1 scrolling down, -1 up
 let lastScrollTop = 0;
+let lastScrollT = 0;        // timestamp of the last scroll sample (perf.now)
+
+// While the user is flinging through the list (think 11k charts), drawing every
+// card they blow past is wasted work that just stalls the main thread. Above this
+// speed we skip rendering entirely and let the data prefetch coast; a short
+// "settle" timer fires renderOnscreen once the scroll slows or stops.
+const FAST_SCROLL_PX_PER_MS = 2.2;   // ~ a fast flick
+let fastScrolling = false;
+const onScrollSettle = debounce(() => {
+  fastScrolling = false;
+  pump(); renderOnscreen(); updateGroupFab();
+}, 130);
 
 // Score a candidate: lower = nearer the viewport. On-screen cards win; off-screen
 // cards are ranked by distance, with the scroll direction discounted 4×.
@@ -652,21 +743,39 @@ function evictPlot(tag) {
   state.live.delete(tag);
 }
 
-// Single authority over which charts are live: render the closest MAX_LIVE_PLOTS
-// on-screen cards that have fresh data, purge everything else. Idempotent — safe
-// to call on any scroll/observer/fetch event without thrashing.
+// Single authority over which charts are live: render the closest on-screen
+// cards that have fresh data, purge everything else. Idempotent — safe to call
+// on any scroll/observer/fetch event without thrashing. SVG cards draw with no
+// limit (no WebGL context); only WebGL cards are rationed to MAX_LIVE_PLOTS.
 function renderOnscreen() {
+  if (fastScrolling) return;   // mid-fling: defer all drawing until scroll settles
   const sig = fetchSig();
   const renderable = [...state.onscreen].filter((t) => {
     const cs = state.cards.get(t);
     return cs && cs.series && cs.fetchSig === sig;
   });
   renderable.sort((a, b) => scoreTag(a) - scoreTag(b));   // closest first
-  const keep = new Set(renderable.slice(0, MAX_LIVE_PLOTS));
+  const keep = new Set();
+  let glBudget = MAX_LIVE_PLOTS;
+  const smoothOn = optSmoothOn();
+  for (const t of renderable) {
+    if (keep.size >= MAX_RENDERED) break;                          // total live cap
+    const cs = state.cards.get(t);
+    cs.glWanted = seriesPointTotal(cs.series, smoothOn) > GL_POINT_THRESHOLD;
+    if (cs.glWanted && glBudget <= 0) continue;                    // GL exhausted — skip this one
+    if (cs.glWanted) glBudget--;                                   // ration WebGL only
+    keep.add(t);
+  }
   for (const t of [...state.live]) if (!keep.has(t)) evictPlot(t);   // purge the rest
+  // Draw at most a few per frame so filling a large render zone (up to 64 cards)
+  // from cache never stalls the main thread — the rest finish on the next frame.
+  let drawn = 0;
   for (const t of keep) {
     const cs = state.cards.get(t), card = $("chart-" + cssId(t));
-    if (card && !(cs.drawn && cs.fetchSig === sig)) drawCard(card, cs.series);
+    if (card && !(cs.drawn && cs.fetchSig === sig)) {
+      drawCard(card, cs.series);
+      if (++drawn >= 12) { requestAnimationFrame(renderOnscreen); break; }
+    }
   }
 }
 
@@ -679,12 +788,20 @@ function pump() {
   }
 }
 
+// Selecting a many-thousand-tag group used to build every placeholder card (and
+// hunt its sorted insert position) in one synchronous burst — a long main-thread
+// stall right after the click. Now the build is time-sliced: the first screenful
+// of cards lands immediately, then the rest fill in over later frames. A token
+// cancels an in-flight build when a newer selection supersedes it.
+let _gridToken = 0;
 function renderGrid() {
   const charts = chartsEl();
   const panel = ensureDiffPanel();            // the text-diff block is pinned last
   if (panel.parentNode !== charts) charts.appendChild(panel);
   // natural sort so layer indices order numerically (layers.2 before layers.10)
   const tags = [...state.selectedTags].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const token = ++_gridToken;                 // any older progressive build now bails
+
   if (!state.selectedRuns.size || !tags.length) {
     observer.takeRecords();
     for (const el of [...charts.children]) {
@@ -704,49 +821,64 @@ function renderGrid() {
     return;
   }
   $("empty")?.remove();
+  const hadCards = state.cards.size > 0;
   const want = new Set(tags);
-  for (const el of [...charts.children]) {
-    const t = el.dataset && el.dataset.tag;
-    if (t && !want.has(t)) {
+
+  // Remove no-longer-wanted cards via a set diff over known tags (no DOM scan).
+  for (const t of [...state.cards.keys()]) {
+    if (want.has(t)) continue;
+    const el = $("chart-" + cssId(t));
+    if (el) {
       observer.unobserve(el); renderObserver.unobserve(el);
-      const pd = document.getElementById("plot-" + cssId(t));
+      const pd = $("plot-" + cssId(t));
       if (pd && pd._fullLayout) { try { Plotly.purge(pd); } catch {} }  // free the WebGL context
       el.remove();
-      state.cards.delete(t); state.visible.delete(t); state.onscreen.delete(t); state.live.delete(t);
     }
+    state.cards.delete(t); state.visible.delete(t); state.onscreen.delete(t); state.live.delete(t);
   }
-  const hadCards = charts.children.length > 0;
+  // Drop group headers up front; rebuilt once the ordered pass finishes, so the
+  // positioning below need only reason about card elements (+ the pinned panel).
+  for (const el of [...charts.querySelectorAll(".group-sep")]) el.remove();
+
+  // Single ordered pass, time-sliced (~8ms/frame): create any missing card and
+  // place each one right after its predecessor. Existing cards already in place
+  // are skipped, so an incremental single-tag add is near free.
   const newCards = [];
-  for (const i in tags) {
-    const tag = tags[i];
-    const id = "chart-" + cssId(tag);
-    if (document.getElementById(id)) continue;
-    const card = document.createElement("div");
-    card.className = "chart pending-card";
-    card.id = id;
-    card.dataset.tag = tag;
-    // Quiet placeholder (no spinner) — the ring only appears if a fetch is slow.
-    card.innerHTML =
-      `<div class="chart-spinner quiet"><div class="ring"></div><div class="cap">${esc(tag)}</div></div>` +
-      `<div class="plot" id="plot-${cssId(tag)}" style="display:none"></div>`;
-    // Insert in sorted position so a newly selected tag lands predictably;
-    // fall back to the diff panel so cards always precede it.
-    let anchor = panel;
-    for (let j = +i + 1; j < tags.length; j++) {
-      const el = document.getElementById("chart-" + cssId(tags[j]));
-      if (el) { anchor = el; break; }
+  const FRAME_MS = 8;
+  let i = 0, prevEl = null;
+  const build = () => {
+    if (token !== _gridToken) return;         // superseded by a newer selection
+    const start = performance.now();
+    while (i < tags.length && (i === 0 || performance.now() - start < FRAME_MS)) {
+      const tag = tags[i++];
+      let card = $("chart-" + cssId(tag));
+      if (!card) {
+        card = document.createElement("div");
+        card.className = "chart pending-card";
+        card.id = "chart-" + cssId(tag);
+        card.dataset.tag = tag;
+        // Quiet placeholder (no spinner) — the ring only appears if a fetch is slow.
+        card.innerHTML =
+          `<div class="chart-spinner quiet"><div class="ring"></div><div class="cap">${esc(tag)}</div></div>` +
+          `<div class="plot" id="plot-${cssId(tag)}" style="display:none"></div>`;
+        state.cards.set(tag, { fetchSig: null, series: null, loading: false, drawn: false });
+        observer.observe(card);
+        renderObserver.observe(card);
+        newCards.push(card);
+      }
+      const ref = prevEl ? prevEl.nextSibling : charts.firstChild;
+      if (ref !== card) charts.insertBefore(card, ref);   // skip if already positioned
+      prevEl = card;
     }
-    charts.insertBefore(card, anchor);
-    state.cards.set(tag, { fetchSig: null, series: null, loading: false, drawn: false });
-    observer.observe(card);
-    renderObserver.observe(card);
-    newCards.push(card);
-  }
-  syncGroupHeaders();
-  charts.appendChild(panel);   // keep the diff panel as the last block
-  pump();              // fetch data for the wide zone
-  renderOnscreen();    // draw any already-cached cards now on-screen
-  if (hadCards && newCards.length) maybeShowNewPill(newCards);
+    if (i < tags.length) { requestAnimationFrame(build); return; }
+    // Build complete for this token.
+    charts.appendChild(panel);   // keep the diff panel as the last block
+    syncGroupHeaders();
+    pump();              // fetch data for the wide zone
+    renderOnscreen();    // draw any already-cached cards now on-screen
+    if (hadCards && newCards.length) maybeShowNewPill(newCards);
+  };
+  build();               // first chunk runs synchronously → first screen is instant
 }
 
 // Full-width collapsible header before each top-level group (the part before
@@ -952,15 +1084,16 @@ async function fetchCard(card) {
 // the server-supplied gap list.
 // Distinct symbol per break kind; fill is the RUN color (so you can tell which
 // run) and a light halo lifts it off the line. Symbols: ✕ NaN, ▲ +Inf, ▼ −Inf.
-// These MUST be scattergl (not scatter): Plotly draws the WebGL line layer above
-// the SVG layer, so SVG markers would stay buried no matter the order. As gl
-// markers appended after the gl lines, trace order puts them on top.
+// The marker trace MUST share the card's trace type (`ttype`): when the lines are
+// WebGL (`scattergl`), Plotly composites that layer above SVG, so SVG markers
+// would stay buried — gl markers appended after the gl lines sit on top. When the
+// lines are SVG (`scatter`), SVG markers layer naturally by trace order.
 const GAP_STYLE = {
   "nan":  { sym: "x",             label: "NaN",  size: 8 },
   "+inf": { sym: "triangle-up",   label: "+Inf", size: 9 },
   "-inf": { sym: "triangle-down", label: "−Inf", size: 9 },
 };
-function addGapMarkers(out, s, xaxis, color) {
+function addGapMarkers(out, s, xaxis, color, ttype) {
   const win = stepRangeActive();
   for (const kind of ["nan", "+inf", "-inf"]) {
     const pts = s.gaps.filter((g) =>
@@ -969,7 +1102,7 @@ function addGapMarkers(out, s, xaxis, color) {
     const st = GAP_STYLE[kind];
     const gx = pts.map((g) => xaxis === "wall_time" ? (g.wall_time - s.wall_time[0]) / 60.0 : g.step);
     out.push({
-      x: gx, y: pts.map((g) => g.y), type: "scattergl", mode: "markers",
+      x: gx, y: pts.map((g) => g.y), type: ttype, mode: "markers",
       marker: { symbol: st.sym, size: st.size, color, line: { width: 1.5, color: "#f5f7fa" } },
       name: st.label, showlegend: false, hoverinfo: "text",
       text: pts.map((g) => `${st.label} · ${s.display_name} · step ${g.step}`),
@@ -986,21 +1119,26 @@ function drawCard(card, series) {
 
   const view = stepLimited(series);
   const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
+  // SVG by default (no WebGL context — immune to context exhaustion / broken
+  // tiles); escalate to WebGL only for point-heavy cards where SVG would drag.
+  const ttype = seriesPointTotal(series, smoothOn) > GL_POINT_THRESHOLD ? "scattergl" : "scatter";
+  const cs = state.cards.get(tag);
+  if (cs) cs.glWanted = ttype === "scattergl";
   const traces = [];
   const gapTraces = [];   // appended last so the markers sit on top of every line
   for (const s of view) {
     const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
     const color = colorFor(s.run_id);
     if (smoothOn) {
-      traces.push({ x, y: s.values, type: "scattergl", mode: "lines",
+      traces.push({ x, y: s.values, type: ttype, mode: "lines",
         line: { color, width: 0.7 }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
-      traces.push({ x, y: smoothValues(s.values, weight), type: "scattergl", mode: "lines",
+      traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode: "lines",
         line: { color, width: 2.2 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     } else {
-      traces.push({ x, y: s.values, type: "scattergl", mode: "lines",
+      traces.push({ x, y: s.values, type: ttype, mode: "lines",
         line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     }
-    if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color);
+    if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color, ttype);
   }
   traces.push(...gapTraces);   // markers drawn after (over) all the lines
   // Outlier clip sets an explicit y-range from value percentiles (of the window).
@@ -1031,9 +1169,8 @@ function drawCard(card, series) {
       `|${win ? win[0] + "-" + win[1] : "fullstep"}`,
   };
   Plotly.react("plot-" + cssId(tag), traces, layout, { responsive: true, displaylogo: false });
-  const cs = state.cards.get(tag);
   if (cs) cs.drawn = true;
-  state.live.add(tag);   // renderOnscreen owns eviction; this just records the live context
+  state.live.add(tag);   // renderOnscreen owns eviction; this just records the drawn plot
 }
 
 // ---- "scroll to new charts" pill -------------------------------------------
@@ -1162,10 +1299,17 @@ const scheduleGrid = debounce(renderGrid, 150);
 function trackScroll(el) {
   const handler = () => {
     const st = el === window ? window.scrollY : el.scrollTop;
+    const now = performance.now();
+    const dt = now - lastScrollT;
+    const vel = dt > 0 ? Math.abs(st - lastScrollTop) / dt : 0;   // px/ms
     if (st !== lastScrollTop) { scrollDir = st > lastScrollTop ? 1 : -1; lastScrollTop = st; }
-    pump();
-    renderOnscreen();   // re-pick the closest live charts as proximity changes
+    lastScrollT = now;
     updateGroupFab();
+    onScrollSettle();   // always schedule a final pass once motion stops
+    if (vel > FAST_SCROLL_PX_PER_MS) { fastScrolling = true; return; }  // flinging: don't draw
+    fastScrolling = false;
+    pump();
+    renderOnscreen();   // re-pick the closest charts as proximity changes
   };
   el.addEventListener("scroll", handler, { passive: true });
 }
