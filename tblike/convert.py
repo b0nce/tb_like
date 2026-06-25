@@ -99,14 +99,44 @@ def load_texts(cache_run_dir: str) -> dict:
     return _load_texts(cache_run_dir)
 
 
+def load_tag_names(cache_run_dir: str) -> list[str] | None:
+    """Read the sorted tag-name sidecar (tags.txt), or None if absent.
+
+    This lets the dashboard list a run's tags without JSON-parsing the multi-MB
+    index (a ~250k-tag run's index is tens of MB). Returns names only — per-tag
+    stats stay in the index, read lazily only when actually needed.
+    """
+    p = os.path.join(cache_run_dir, "tags.txt")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as fh:
+            return [ln[:-1] if ln.endswith("\n") else ln for ln in fh if ln.strip()]
+    except OSError:
+        return None
+
+
+def _write_tag_names(cache_run_dir: str, tags) -> None:
+    p = os.path.join(cache_run_dir, "tags.txt")
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(sorted(tags)))
+    os.replace(tmp, p)  # atomic
+
+
 def load_meta(cache_run_dir: str) -> dict | None:
-    """Read the small per-run meta.json, lazily creating it from index.json
-    for caches written before the split (one-time, cheap thereafter)."""
+    """Read the small per-run meta.json, lazily (re)creating it from index.json
+    for caches written before the split or before newer meta fields were added
+    (one-time, cheap thereafter)."""
     p = os.path.join(cache_run_dir, "meta.json")
     if os.path.exists(p):
         try:
             with open(p) as fh:
-                return json.load(fh)
+                m = json.load(fh)
+            # Upgrade meta written before these fields existed (so the series path
+            # and step slider can rely on them) — otherwise reuse as-is.
+            if "segments" in m and "step_max" in m:
+                return m
         except (OSError, json.JSONDecodeError):
             pass
     idx = load_index(cache_run_dir)
@@ -122,12 +152,30 @@ def load_meta(cache_run_dir: str) -> dict | None:
 
 # Keys surfaced in the lightweight per-run meta.json (read for run listing, so
 # the dashboard never has to parse the multi-MB tags map just to show the list).
-META_KEYS = ("run_id", "display_name", "num_rows", "num_event_files", "updated_at", "config", "text_tags")
+# `segments` is here too so the hot series-read path lists Parquet files without
+# parsing the (up to ~250k-tag) index; `step_min/step_max` give the global step
+# range so the client's step slider need not scan every tag.
+META_KEYS = (
+    "run_id", "display_name", "num_rows", "num_event_files", "updated_at",
+    "config", "text_tags", "segments",
+)
 
 
 def meta_from_index(index: dict) -> dict:
     m = {k: index.get(k) for k in META_KEYS}
-    m["num_tags"] = len(index.get("tags", {}))
+    tags = index.get("tags", {})
+    m["num_tags"] = len(tags)
+    # Global step extent across the run, folded once here (O(tags), only when meta
+    # is (re)written) so the dashboard reads it as O(1) instead of scanning tags.
+    lo, hi = None, None
+    for st in tags.values():
+        mn, mx = st.get("min_step"), st.get("max_step")
+        if mn is not None:
+            lo = mn if lo is None else min(lo, mn)
+        if mx is not None:
+            hi = mx if hi is None else max(hi, mx)
+    m["step_min"] = lo if lo is not None else 0
+    m["step_max"] = hi if hi is not None else 0
     return m
 
 
@@ -375,6 +423,13 @@ def convert_run(
         }
     )
     _write_index(cache_run_dir, index)
+    # Refresh the tag-name sidecar when the tag set may have changed (new segment)
+    # or it's missing (older cache being upgraded).
+    if segment_name or not os.path.exists(os.path.join(cache_run_dir, "tags.txt")):
+        try:
+            _write_tag_names(cache_run_dir, tags.keys())
+        except OSError:
+            pass
 
     return ConvertResult(
         run_id=run_id,

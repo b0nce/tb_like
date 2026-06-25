@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.gzip import GZipMiddleware
 
 from .convert import backfill_texts, convert_run
 from .store import Store
@@ -45,6 +46,9 @@ def create_app(
         watcher.stop()
 
     app = FastAPI(title="tb_like", version="0.1.0", lifespan=lifespan)
+    # Compress large JSON (the tag-name list and series payloads). Tag names share
+    # long prefixes, so this shrinks a 250k-tag response ~10×. Skips tiny bodies.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.state.store = store
     app.state.watcher = watcher
 
@@ -54,10 +58,12 @@ def create_app(
 
     @app.get("/api/tags")
     def get_tags(runs: str = ""):
+        # Returns just the union of tag NAMES (from the tags.txt sidecars), so even
+        # a 250k-tag run sends a compact list — no per-tag stats, no index parse.
         run_ids = [r for r in runs.split(",") if r]
         if not run_ids:
             run_ids = store.run_ids()
-        return {"tags": store.tags_for(run_ids)}
+        return {"tags": store.tag_names(run_ids)}
 
     @app.post("/api/series")
     def post_series(req: SeriesRequest):

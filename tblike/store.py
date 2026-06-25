@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
-from .convert import load_index, load_meta, load_texts
+from .convert import load_index, load_meta, load_tag_names, load_texts
 from .downsample import lttb
 
 
@@ -64,23 +64,51 @@ class RunInfo:
     num_event_files: int
     updated_at: float
     config: dict
+    step_min: int
+    step_max: int
+
+
+# A single huge run's index.json holds a ~250k-tag stats map (tens of MB parsed),
+# so the in-memory caches are bounded: without a cap, browsing many big runs would
+# pin them all resident. meta/texts are tiny, so they get a roomier cap.
+_INDEX_CACHE_MAX = 24
+_META_CACHE_MAX = 1024
+_TEXTS_CACHE_MAX = 256
+_TAGNAMES_CACHE_MAX = 12   # each list can hold ~250k strings — keep few resident
+_RUNIDS_TTL = 2.0   # seconds; run_ids() is polled often (status) — don't re-listdir each time
+
+
+def _cache_put(cache: dict, key, value, cap: int) -> None:
+    """Insert into an insertion-ordered dict, evicting the oldest over `cap`."""
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > cap:
+        cache.pop(next(iter(cache)))
 
 
 class Store:
     def __init__(self, cache_dir: str):
         self.cache_dir = cache_dir
         self._index_cache: dict[str, tuple[float, dict]] = {}  # run_id -> (mtime, index)
+        self._meta_cache: dict[str, tuple[float, dict]] = {}   # run_id -> (mtime, meta)
         self._texts_cache: dict[str, tuple[float, dict]] = {}  # run_id -> (mtime, texts)
+        self._tagnames_cache: dict[str, tuple[float, list]] = {}  # run_id -> (mtime, names)
+        self._runids: tuple[float, list[str]] | None = None    # (read_at, ids)
 
     # ---- discovery -------------------------------------------------------
     def run_ids(self) -> list[str]:
-        if not os.path.isdir(self.cache_dir):
-            return []
-        out = []
-        for name in os.listdir(self.cache_dir):
-            if os.path.exists(os.path.join(self.cache_dir, name, "index.json")):
-                out.append(name)
-        return sorted(out)
+        import time
+        now = time.monotonic()
+        if self._runids and now - self._runids[0] < _RUNIDS_TTL:
+            return self._runids[1]
+        out: list[str] = []
+        if os.path.isdir(self.cache_dir):
+            for name in os.listdir(self.cache_dir):
+                if os.path.exists(os.path.join(self.cache_dir, name, "index.json")):
+                    out.append(name)
+            out.sort()
+        self._runids = (now, out)
+        return out
 
     def _index(self, run_id: str) -> dict | None:
         p = os.path.join(self.cache_dir, run_id, "index.json")
@@ -94,15 +122,33 @@ class Store:
             return cached[1]
         idx = load_index(os.path.join(self.cache_dir, run_id))
         if idx is not None:
-            self._index_cache[run_id] = (mtime, idx)
+            _cache_put(self._index_cache, run_id, (mtime, idx), _INDEX_CACHE_MAX)
         return idx
+
+    def _meta(self, run_id: str) -> dict | None:
+        """Small per-run meta (display_name, segments, step range, …). The hot
+        series-read path uses this so it never parses the giant index.json."""
+        p = os.path.join(self.cache_dir, run_id, "meta.json")
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            # meta may not exist yet (old cache); load_meta creates it from index.
+            m = load_meta(os.path.join(self.cache_dir, run_id))
+            return m
+        cached = self._meta_cache.get(run_id)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        m = load_meta(os.path.join(self.cache_dir, run_id))
+        if m is not None:
+            _cache_put(self._meta_cache, run_id, (mtime, m), _META_CACHE_MAX)
+        return m
 
     def list_runs(self) -> list[RunInfo]:
         # Uses the small meta.json per run, so listing 200+ runs stays fast and
         # never parses the multi-MB tags map.
         runs = []
         for rid in self.run_ids():
-            m = load_meta(os.path.join(self.cache_dir, rid))
+            m = self._meta(rid)
             if not m:
                 continue
             runs.append(
@@ -114,38 +160,49 @@ class Store:
                     num_event_files=m.get("num_event_files", 0),
                     updated_at=m.get("updated_at", 0.0),
                     config=m.get("config", {}),
+                    step_min=m.get("step_min", 0),
+                    step_max=m.get("step_max", 0),
                 )
             )
         return runs
 
-    def tags_for(self, run_ids: list[str]) -> dict[str, dict]:
-        """Union of tags across the given runs, with merged step ranges."""
-        merged: dict[str, dict] = {}
+    def _tag_names(self, run_id: str) -> list[str]:
+        p = os.path.join(self.cache_dir, run_id, "tags.txt")
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            # Old cache without the sidecar: derive from the index (it'll be
+            # written on the next convert pass, so this fallback is one-time).
+            idx = self._index(run_id)
+            return list(idx.get("tags", {}).keys()) if idx else []
+        cached = self._tagnames_cache.get(run_id)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        names = load_tag_names(os.path.join(self.cache_dir, run_id)) or []
+        _cache_put(self._tagnames_cache, run_id, (mtime, names), _TAGNAMES_CACHE_MAX)
+        return names
+
+    def tag_names(self, run_ids: list[str]) -> list[str]:
+        """Union of tag names across the given runs (sorted), read from the tiny
+        tags.txt sidecar so listing never parses the giant index. The client only
+        needs names; per-tag stats stay server-side, read lazily when needed."""
+        if len(run_ids) == 1:
+            return self._tag_names(run_ids[0])   # already sorted in the sidecar
+        seen: set[str] = set()
         for rid in run_ids:
-            idx = self._index(rid)
-            if not idx:
-                continue
-            for tag, st in idx.get("tags", {}).items():
-                m = merged.get(tag)
-                if m is None:
-                    merged[tag] = {
-                        "min_step": st.get("min_step", 0),
-                        "max_step": st.get("max_step", 0),
-                        "runs": 1,
-                    }
-                else:
-                    m["min_step"] = min(m["min_step"], st.get("min_step", 0))
-                    m["max_step"] = max(m["max_step"], st.get("max_step", 0))
-                    m["runs"] += 1
-        return merged
+            seen.update(self._tag_names(rid))
+        return sorted(seen)
 
     # ---- series reads ----------------------------------------------------
     def _segment_paths(self, run_id: str) -> list[str]:
-        idx = self._index(run_id)
-        if not idx:
-            return []
+        # Prefer meta (tiny) so a series read never parses the giant index; fall
+        # back to the index only for caches whose meta predates `segments`.
+        m = self._meta(run_id) or {}
+        segs = m.get("segments")
+        if segs is None:
+            segs = (self._index(run_id) or {}).get("segments", [])
         base = os.path.join(self.cache_dir, run_id, "data")
-        return [os.path.join(base, s) for s in idx.get("segments", [])]
+        return [os.path.join(base, s) for s in segs]
 
     def _run_frame(self, run_id: str, tags: list[str]) -> pl.DataFrame:
         paths = self._segment_paths(run_id)
@@ -162,10 +219,12 @@ class Store:
         )
 
     def _series_for_run(self, rid: str, tags: list[str], max_points: int) -> list[dict]:
-        idx = self._index(rid)
-        if not idx:
+        # Series reads only need display_name + segment paths, both in the tiny
+        # meta — so a chart fetch never parses the run's ~250k-tag index.
+        m = self._meta(rid)
+        if not m:
             return []
-        display = idx.get("display_name", rid)
+        display = m.get("display_name", rid)
         df = self._run_frame(rid, tags)
         if df.is_empty():
             return []
@@ -237,7 +296,7 @@ class Store:
         if cached and cached[0] == mtime:
             return cached[1]
         texts = load_texts(os.path.join(self.cache_dir, run_id))
-        self._texts_cache[run_id] = (mtime, texts)
+        _cache_put(self._texts_cache, run_id, (mtime, texts), _TEXTS_CACHE_MAX)
         return texts
 
     def text_index(self, run_ids: list[str]) -> dict:

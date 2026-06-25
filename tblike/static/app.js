@@ -3,7 +3,8 @@
 const state = {
   runs: [],                 // [{run_id, display_name, ...}]
   selectedRuns: new Set(),
-  tags: {},                 // tag -> {min_step, max_step, runs}
+  tagNames: [],             // sorted union of tag names for the loaded runs
+  tagRuns: [],              // run ids those tag names came from (for step bounds)
   selectedTags: new Set(),
   runColor: new Map(),
   expanded: new Set(),      // group paths currently expanded in the tag tree
@@ -99,18 +100,20 @@ async function loadTags(force = false) {
   if (!runs.length) return;
   const numTags = (rid) => state.runs.find((r) => r.run_id === rid)?.num_tags ?? -1;
   const counts = runs.map(numTags);
-  const haveTags = Object.keys(state.tags).length > 0;
+  const haveTags = state.tagNames.length > 0;
   if (!force && haveTags && counts.every((c) => state.loadedTagCounts.has(c))) return;
 
   busy(sel.length ? `loading tags for ${sel.length} run(s)…` : "loading tags…");
   if (!haveTags) $("tag-list").innerHTML = `<div class="placeholder">loading tags…</div>`;
   try {
     const r = await fetch("api/tags?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json());
-    state.tags = r.tags;
+    state.tagNames = r.tags;       // server now returns a compact names list
+    state.tagRuns = runs;
+    _tagsVersion++;   // invalidate the memoized tag tree
     state.loadedTagCounts = new Set(counts);
     recomputeStepBounds();
     renderTagTree();
-    idle(`${Object.keys(state.tags).length.toLocaleString()} tags`);
+    idle(`${state.tagNames.length.toLocaleString()} tags`);
   } catch (e) {
     idle("failed to load tags");
   }
@@ -354,6 +357,138 @@ function refreshTreeChecks() {
   }
 }
 
+// buildTagTree (string splits + several restructuring passes over up to ~18k
+// names) is the costly part and depends ONLY on the filtered name set — never on
+// selection or expansion. Memoize it and rebuild only when that set changes;
+// expand/collapse and selection toggles reuse the cached tree. The key folds in
+// everything that alters the name set: filter, selected-only mode, and version
+// counters bumped when the tags map or the selected snapshot changes.
+let _tagsVersion = 0, _snapVersion = 0;
+let _treeCache = { key: null, root: null };
+function buildTagTreeCached(names, key) {
+  if (_treeCache.key !== key) _treeCache = { key, root: buildTagTree(names) };
+  return _treeCache.root;
+}
+
+// Rebuild the checkbox registry from the DOM after an incremental expand/collapse
+// (cheap — bounded by visible rows; the point is to avoid a full tree re-render).
+function rebuildTreeRows() {
+  _treeRows = [];
+  for (const row of $("tag-list").children) {
+    const node = row._node;
+    if (!node) continue;   // skip the ".tmore" sentinel
+    _treeRows.push({
+      row, node, isGroup: node.children.size > 0, tag: node.tag,
+      cb: row.querySelector('input[type="checkbox"]'),
+    });
+  }
+}
+
+// Expand/collapse WITHOUT re-rendering the whole tree. Rows are a flat DFS list
+// tagged with their depth, so a node's descendants are exactly the contiguous run
+// of deeper rows right after it: collapse removes that run; expand builds the
+// node's subtree into a fragment and splices it in.
+function toggleExpand(node, rowEl) {
+  const caret = rowEl.querySelector(".caret");
+  const depth = +rowEl.dataset.depth;
+  if (state.expanded.has(node.path)) {
+    state.expanded.delete(node.path);
+    let el = rowEl.nextElementSibling;
+    while (el && +el.dataset.depth > depth) { const next = el.nextElementSibling; el.remove(); el = next; }
+    caret.textContent = "▶";
+  } else {
+    state.expanded.add(node.path);
+    const frag = document.createDocumentFragment();
+    renderTreeChildren(frag, node, depth + 1);
+    rowEl.after(frag);
+    caret.textContent = "▼";
+  }
+  rebuildTreeRows();
+}
+
+// Render a node's children (honoring nested expansion) into `container` — the
+// live list for a full render, or a fragment for an incremental expand. Each row
+// carries its depth + node so expand/collapse can splice subtrees in place.
+function renderTreeChildren(container, node, depth) {
+  const kids = sortedChildren(node);
+  const limited = kids.slice(0, MAX_CHILDREN);
+  for (const child of limited) {
+    const isGroup = child.children.size > 0;
+    const row = document.createElement("div");
+    row.className = "tnode " + (isGroup ? "group" : "leaf-row");
+    row.style.paddingLeft = 6 + depth * 14 + "px";
+    row.dataset.depth = depth;
+    row._node = child;
+
+    // instant tooltip with the full tag/group path (names are truncated)
+    const full = child.tag || child.path + "/";
+    row.addEventListener("mousemove", (e) => showTip(full, e.clientX, e.clientY));
+    row.addEventListener("mouseleave", hideTip);
+
+    const caret = document.createElement("span");
+    caret.className = "caret" + (isGroup ? "" : " leaf");
+    const expanded = state.expanded.has(child.path);
+    caret.textContent = isGroup ? (expanded ? "▼" : "▶") : "•";
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    if (isGroup) {
+      const st = groupSelectState(child);
+      cb.checked = st === "all";
+      cb.indeterminate = st === "some";
+      cb.onchange = () => {
+        const turnOn = !(groupSelectState(child) === "all");
+        for (const t of child.tags) turnOn ? state.selectedTags.add(t) : state.selectedTags.delete(t);
+        const delta = (turnOn ? child.tags.length : 0) - (child.sel || 0);
+        setSubtreeSel(child, turnOn);
+        for (let n = child.parent; n; n = n.parent) n.sel = (n.sel || 0) + delta;
+        refreshTreeChecks(); updatePending(); scheduleGrid();
+      };
+    } else {
+      cb.checked = state.selectedTags.has(child.tag);
+      cb.onchange = () => {
+        const on = cb.checked;
+        on ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
+        const d = on ? 1 : -1;   // bubble the single change up to every ancestor
+        for (let n = child; n; n = n.parent) n.sel = (n.sel || 0) + d;
+        refreshTreeChecks(); updatePending(); scheduleGrid();
+      };
+    }
+
+    const label = document.createElement("span");
+    label.className = "label";
+    const childSep = isGroup ? (child.children.values().next().value?.sep || "") : "";
+    label.textContent = child.name + childSep;
+    label.title = child.tag || child.path;
+
+    row.append(caret, cb, label);
+    if (isGroup || child.tags.length > 1) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = child.tags.length;
+      row.append(badge);
+    }
+
+    if (isGroup) {
+      const toggle = (e) => { if (e.target === cb) return; toggleExpand(child, row); };
+      caret.onclick = toggle;
+      label.onclick = toggle;
+    }
+    container.appendChild(row);
+    _treeRows.push({ row, cb, isGroup, node: child, tag: child.tag });
+
+    if (isGroup && expanded) renderTreeChildren(container, child, depth + 1);
+  }
+  if (kids.length > limited.length) {
+    const more = document.createElement("div");
+    more.className = "tmore";
+    more.style.paddingLeft = 6 + (depth + 1) * 14 + "px";
+    more.dataset.depth = depth + 1;   // so collapse removes it with the subtree
+    more.textContent = `+${kids.length - limited.length} more — refine the filter`;
+    container.appendChild(more);
+  }
+}
+
 function renderTagTree() {
   hideTip();
   const filter = $("tag-filter").value.trim();
@@ -362,13 +497,14 @@ function renderTagTree() {
   _treeRows = [];
 
   const match = makeTagMatcher(filter);
-  let names = Object.keys(state.tags);
+  let names = state.tagNames;
   if (match) names = names.filter(match);
   // Selected mode shows the frozen snapshot, so deselecting just greys an item
   // out (it stays put) instead of removing it from the list.
   if (state.showSelectedOnly) names = names.filter((t) => state.selectedSnapshot.has(t));
-  const root = buildTagTree(names);
-  annotateTree(root, null);   // parent pointers + cached selected-counts (for O(1) toggles)
+  const key = filter + "\x00" + (state.showSelectedOnly ? "S" : "") + "\x00" + _tagsVersion + "\x00" + _snapVersion;
+  const root = buildTagTreeCached(names, key);
+  annotateTree(root, null);   // refresh parent pointers + cached selected-counts
 
   // When the filter or selected-only mode *changes*, auto-expand the groups
   // leading to the shown tags — but only once, so manual expand/collapse sticks.
@@ -385,95 +521,9 @@ function renderTagTree() {
     }
   }
 
-  let rendered = 0;
-  const renderChildren = (node, depth) => {
-    const kids = sortedChildren(node);
-    const limited = kids.slice(0, MAX_CHILDREN);
-    for (const child of limited) {
-      const isGroup = child.children.size > 0;
-      const row = document.createElement("div");
-      row.className = "tnode " + (isGroup ? "group" : "leaf-row");
-      row.style.paddingLeft = 6 + depth * 14 + "px";
+  renderTreeChildren(list, root, 0);
 
-      // instant tooltip with the full tag/group path (names are truncated)
-      const full = child.tag || child.path + "/";
-      row.addEventListener("mousemove", (e) => showTip(full, e.clientX, e.clientY));
-      row.addEventListener("mouseleave", hideTip);
-
-      const caret = document.createElement("span");
-      caret.className = "caret" + (isGroup ? "" : " leaf");
-      const expanded = state.expanded.has(child.path);
-      caret.textContent = isGroup ? (expanded ? "▼" : "▶") : "•";
-
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      if (isGroup) {
-        const st = groupSelectState(child);
-        cb.checked = st === "all";
-        cb.indeterminate = st === "some";
-        cb.onchange = () => {
-          const turnOn = !(groupSelectState(child) === "all");
-          for (const t of child.tags) turnOn ? state.selectedTags.add(t) : state.selectedTags.delete(t);
-          // Maintain cached counts: set the whole subtree, then fold the net
-          // delta into the ancestors. Keeps every later toggle O(depth).
-          const delta = (turnOn ? child.tags.length : 0) - (child.sel || 0);
-          setSubtreeSel(child, turnOn);
-          for (let n = child.parent; n; n = n.parent) n.sel = (n.sel || 0) + delta;
-          refreshTreeChecks(); updatePending(); scheduleGrid();   // update checks in place — no tree rebuild
-        };
-      } else {
-        cb.checked = state.selectedTags.has(child.tag);
-        cb.onchange = () => {
-          const on = cb.checked;
-          on ? state.selectedTags.add(child.tag) : state.selectedTags.delete(child.tag);
-          const d = on ? 1 : -1;   // bubble the single change up to every ancestor
-          for (let n = child; n; n = n.parent) n.sel = (n.sel || 0) + d;
-          refreshTreeChecks(); updatePending(); scheduleGrid();   // refresh ancestor group states too
-        };
-      }
-
-      const label = document.createElement("span");
-      label.className = "label";
-      // trailing separator reflects how this node joins to its children ("/" or ".")
-      const childSep = isGroup ? (child.children.values().next().value?.sep || "") : "";
-      label.textContent = child.name + childSep;
-      label.title = child.tag || child.path;
-
-      row.append(caret, cb, label);
-      if (isGroup || child.tags.length > 1) {
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = child.tags.length;
-        row.append(badge);
-      }
-
-      // clicking the row (not the checkbox) toggles expand for groups
-      if (isGroup) {
-        const toggle = (e) => {
-          if (e.target === cb) return;
-          state.expanded.has(child.path) ? state.expanded.delete(child.path) : state.expanded.add(child.path);
-          renderTagTree();
-        };
-        caret.onclick = toggle;
-        label.onclick = toggle;
-      }
-      list.appendChild(row);
-      _treeRows.push({ row, cb, isGroup, node: child, tag: child.tag });
-      rendered++;
-
-      if (isGroup && expanded) renderChildren(child, depth + 1);
-    }
-    if (kids.length > limited.length) {
-      const more = document.createElement("div");
-      more.className = "tmore";
-      more.style.paddingLeft = 6 + (depth + 1) * 14 + "px";
-      more.textContent = `+${kids.length - limited.length} more — refine the filter`;
-      list.appendChild(more);
-    }
-  };
-  renderChildren(root, 0);
-
-  const total = Object.keys(state.tags).length;
+  const total = state.tagNames.length;
   $("tag-count").textContent = (filter || state.showSelectedOnly)
     ? `(${names.length}/${total})` : `(${total})`;
 }
@@ -531,14 +581,16 @@ const _human = (n) => {
   return String(n);
 };
 
-// Global step extent across all loaded tags. Snap the user's window to the new
-// edges if it was sitting at the old ones, otherwise clamp it inside the bounds.
+// Global step extent for the loaded runs. Read from each run's meta (O(runs))
+// rather than scanning every tag, so 250k tags cost nothing here. Snap the user's
+// window to the new edges if it was sitting at the old ones, else clamp inside.
 function recomputeStepBounds() {
   let min = Infinity, max = -Infinity;
-  for (const t in state.tags) {
-    const m = state.tags[t];
-    if (m.min_step != null) min = Math.min(min, m.min_step);
-    if (m.max_step != null) max = Math.max(max, m.max_step);
+  for (const rid of state.tagRuns) {
+    const run = state.runs.find((x) => x.run_id === rid);
+    if (!run) continue;
+    if (run.step_min != null) min = Math.min(min, run.step_min);
+    if (run.step_max != null) max = Math.max(max, run.step_max);
   }
   if (!isFinite(min)) { min = 0; max = 0; }
   const prev = state.stepBounds, r = state.stepRange;
@@ -1133,7 +1185,7 @@ function drawCard(card, series) {
       traces.push({ x, y: s.values, type: ttype, mode: "lines",
         line: { color, width: 0.7 }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
       traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode: "lines",
-        line: { color, width: 2.2 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+        line: { color, width: 1.5 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     } else {
       traces.push({ x, y: s.values, type: ttype, mode: "lines",
         line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
@@ -1340,7 +1392,7 @@ $("runs-none").onclick = () => {
 };
 $("tags-expand").onclick = () => {
   // expand only the top-level groups (cheap; deep expand of 18k tags is huge)
-  for (const t of Object.keys(state.tags)) {
+  for (const t of state.tagNames) {
     const top = t.split("/")[0];
     if (t.includes("/")) state.expanded.add(top);
   }
@@ -1349,7 +1401,7 @@ $("tags-expand").onclick = () => {
 $("tags-selected").onclick = () => {
   state.showSelectedOnly = !state.showSelectedOnly;
   // Freeze the shown set on entering, so toggling rows doesn't shrink the list.
-  if (state.showSelectedOnly) state.selectedSnapshot = new Set(state.selectedTags);
+  if (state.showSelectedOnly) { state.selectedSnapshot = new Set(state.selectedTags); _snapVersion++; }
   $("tags-selected").classList.toggle("active", state.showSelectedOnly);
   renderTagTree();
 };
