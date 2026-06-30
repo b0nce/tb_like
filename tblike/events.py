@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -24,6 +25,25 @@ from tensorboard.util import tensor_util
 EVENT_GLOB = "events.out.tfevents.*"
 
 _Event = event_pb2.Event
+
+# A directory level that's just a timestamp / run-id — e.g.
+# "20260618_101116_148035" or "1700000000". Such levels are eval-run *containers*,
+# not part of a metric's identity, so they're dropped from the nested-tag prefix:
+# otherwise the same autometric logged under each eval folder splits into one
+# single-point tag per timestamp instead of forming one series across evals.
+_ID_DIR = re.compile(r"^[\d_]+$")
+
+
+def _clean_prefix(rel: str) -> str:
+    """Subpath -> tag prefix, dropping timestamp/run-id directory levels."""
+    if rel == ".":
+        return ""
+    parts = []
+    for p in rel.split(os.sep):
+        if _ID_DIR.match(p) and len(p.replace("_", "")) >= 8:
+            continue  # timestamp/id container — not part of the metric name
+        parts.append(p)
+    return "/".join(parts)
 
 
 def iter_event_records(path: str) -> Iterator[bytes]:
@@ -115,7 +135,9 @@ def discover_event_files(run_dir: str) -> list[tuple[str, str, str]]:
 
       * ``prefix`` — the file's directory relative to ``run_dir`` (``""`` at the
         top level), prepended to each tag so nested series read ``metrics/sub/loss``
-        and never collide with a top-level ``loss``.
+        and never collide with a top-level ``loss``. Timestamp/run-id directory
+        levels are dropped (see :func:`_clean_prefix`) so the same metric logged
+        under many eval folders stays one series.
       * ``relkey`` — the file's path relative to ``run_dir`` (forward-slashed),
         used as the per-file ingest-state key. Two nested files can share a
         basename (``events.out.tfevents.autometrics`` in different subdirs), so the
@@ -132,7 +154,7 @@ def discover_event_files(run_dir: str) -> list[tuple[str, str, str]]:
                 continue
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(dirpath, run_dir)
-            prefix = "" if rel == "." else rel.replace(os.sep, "/")
+            prefix = _clean_prefix(rel)            # drop timestamp/id dir levels
             relkey = os.path.relpath(path, run_dir).replace(os.sep, "/")
             out.append((path, prefix, relkey))
     out.sort(key=lambda t: t[2])

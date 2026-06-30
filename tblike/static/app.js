@@ -584,6 +584,14 @@ function renderTagTree() {
     ? `(${names.length}/${total})` : `(${total})`;
 }
 
+// Number of finite (plottable) values — a series with just one draws no visible
+// line, so we render it as a marker dot instead.
+function finiteCount(values) {
+  let n = 0;
+  for (const v of values) if (v != null && isFinite(v)) n++;
+  return n;
+}
+
 // ---- smoothing (TensorBoard-style EMA with debias) -------------------------
 function smoothValues(values, weight) {
   const out = new Array(values.length);
@@ -1156,14 +1164,19 @@ async function renderOverlay() {
       const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
       const color = colorFor(s.run_id);
       const nm = `${s.display_name} · ${label}`;
+      const dot = finiteCount(s.values) <= 1;
+      const mode = dot ? "markers" : "lines";
       if (smoothOn) {
-        traces.push({ x, y: s.values, type: ttype, mode: "lines", yaxis,
-          line: { color, width: 0.7, dash }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: nm });
-        traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode: "lines", yaxis,
-          line: { color, width: 1.5, dash }, name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
+        traces.push({ x, y: s.values, type: ttype, mode, yaxis,
+          line: { color, width: 0.7, dash }, marker: dot ? { color, size: 6 } : undefined,
+          opacity: 0.13, hoverinfo: "skip", showlegend: false, name: nm });
+        traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode, yaxis,
+          line: { color, width: 1.5, dash }, marker: dot ? { color, size: 7 } : undefined,
+          name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
       } else {
-        traces.push({ x, y: s.values, type: ttype, mode: "lines", yaxis,
-          line: { color, width: 1.5, dash }, name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
+        traces.push({ x, y: s.values, type: ttype, mode, yaxis,
+          line: { color, width: 1.5, dash }, marker: dot ? { color, size: 7 } : undefined,
+          name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
       }
     }
     return view;
@@ -1435,14 +1448,20 @@ function drawCard(card, series) {
   for (const s of view) {
     const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
     const color = colorFor(s.run_id);
+    // One lone point has no line to draw — show a dot so the series is visible.
+    const dot = finiteCount(s.values) <= 1;
+    const mode = dot ? "markers" : "lines";
     if (smoothOn) {
-      traces.push({ x, y: s.values, type: ttype, mode: "lines",
-        line: { color, width: 0.7 }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
-      traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode: "lines",
-        line: { color, width: 1.5 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+      traces.push({ x, y: s.values, type: ttype, mode,
+        line: { color, width: 0.7 }, marker: dot ? { color, size: 6 } : undefined,
+        opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
+      traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode,
+        line: { color, width: 1.5 }, marker: dot ? { color, size: 7 } : undefined,
+        name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     } else {
-      traces.push({ x, y: s.values, type: ttype, mode: "lines",
-        line: { color, width: 1.4 }, name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+      traces.push({ x, y: s.values, type: ttype, mode,
+        line: { color, width: 1.4 }, marker: dot ? { color, size: 7 } : undefined,
+        name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     }
     if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color, ttype);
   }
@@ -1652,27 +1671,87 @@ async function applySelection(payload) {
   idle(`restored selection: ${payload.name || "shared"}`);
 }
 
-async function shareSelection() {
+// Inline dialog instead of prompt()/clipboard — both are unreliable on mobile
+// (prompt is blocked in several mobile browsers; navigator.clipboard is absent on
+// non-HTTPS origins like http://<server-ip>:<port>). The link is shown in a
+// selectable field with a copy button that degrades gracefully.
+async function copyText(input) {
+  input.focus(); input.select(); input.setSelectionRange(0, input.value.length);
+  try { if (navigator.clipboard) { await navigator.clipboard.writeText(input.value); return true; } } catch {}
+  try { return document.execCommand("copy"); } catch { return false; }
+}
+
+function shareSelection() {
   if (!state.selectedRuns.size && !state.selectedTags.size) {
     idle("nothing selected to share");
     return;
   }
-  const name = prompt("Name this selection (used in the share link):");
-  if (!name) return;
-  busy("creating share link…");
-  try {
-    const r = await fetch("api/selections", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, ...selectionPayload() }),
-    }).then((x) => x.json());
-    const url = new URL(document.baseURI);
-    url.searchParams.set("sel", r.id);
-    const link = url.toString();
-    try { await navigator.clipboard.writeText(link); idle("share link copied ✓ — " + link); }
-    catch { window.prompt("Share link:", link); idle("share link ready"); }
-  } catch (e) {
-    idle("failed to create share link");
-  }
+  $("sharedlg")?.remove();
+  const dlg = document.createElement("div");
+  dlg.id = "sharedlg";
+  dlg.className = "modal";
+  dlg.innerHTML =
+    `<div class="modal-box">` +
+      `<div class="modal-head">Share selection</div>` +
+      `<div class="modal-body">` +
+        `<label class="modal-label" for="share-name">Name this selection</label>` +
+        `<input type="text" class="modal-input" id="share-name" placeholder="e.g. lr sweep — loss vs vio" autocomplete="off" />` +
+        `<div class="modal-actions">` +
+          `<button class="modal-btn" id="share-cancel">Cancel</button>` +
+          `<button class="modal-btn primary" id="share-create">Create link</button>` +
+        `</div>` +
+        `<div class="modal-result" id="share-result" style="display:none">` +
+          `<label class="modal-label" for="share-link">Shareable link</label>` +
+          `<input type="text" class="modal-input" id="share-link" readonly />` +
+          `<div class="modal-actions">` +
+            `<a class="modal-btn" id="share-open" target="_blank" rel="noopener">Open ↗</a>` +
+            `<button class="modal-btn" id="share-copy">Copy</button>` +
+            `<button class="modal-btn primary" id="share-done">Done</button>` +
+          `</div>` +
+          `<div class="modal-hint" id="share-hint">On mobile you can also tap the link, then long-press → Copy.</div>` +
+        `</div>` +
+      `</div>` +
+    `</div>`;
+  document.body.appendChild(dlg);
+  const close = () => dlg.remove();
+  dlg.addEventListener("mousedown", (e) => { if (e.target === dlg) close(); });   // tap backdrop
+  $("share-cancel").onclick = close;
+  $("share-done").onclick = close;
+  const nameInput = $("share-name");
+  setTimeout(() => nameInput.focus(), 0);
+
+  const create = async () => {
+    const name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    const btn = $("share-create");
+    btn.disabled = true; btn.textContent = "creating…";
+    try {
+      const r = await fetch("api/selections", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, ...selectionPayload() }),
+      }).then((x) => x.json());
+      const url = new URL(document.baseURI);
+      url.searchParams.set("sel", r.id);
+      const link = url.toString();
+      const linkInput = $("share-link");
+      linkInput.value = link;
+      $("share-open").href = link;
+      $("share-result").style.display = "";
+      nameInput.disabled = true;
+      btn.style.display = "none"; $("share-cancel").style.display = "none";
+      linkInput.focus(); linkInput.select();
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Create link";
+      $("share-hint").textContent = "Failed to create link — try again.";
+      $("share-result").style.display = "";
+    }
+  };
+  $("share-create").onclick = create;
+  nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") create(); });
+  $("share-copy").onclick = async () => {
+    const ok = await copyText($("share-link"));
+    $("share-hint").textContent = ok ? "Copied ✓" : "Selected — long-press → Copy.";
+  };
 }
 
 // Redraw the live charts from cached data (style-only changes).
