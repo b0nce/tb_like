@@ -1168,14 +1168,14 @@ async function renderOverlay() {
       const mode = dot ? "markers" : "lines";
       if (smoothOn) {
         traces.push({ x, y: s.values, type: ttype, mode, yaxis,
-          line: { color, width: 0.7, dash }, marker: dot ? { color, size: 6 } : undefined,
+          line: { color, width: 0.7, dash }, ...(dot ? { marker: { color, size: 6 } } : {}),
           opacity: 0.13, hoverinfo: "skip", showlegend: false, name: nm });
         traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode, yaxis,
-          line: { color, width: 1.5, dash }, marker: dot ? { color, size: 7 } : undefined,
+          line: { color, width: 1.5, dash }, ...(dot ? { marker: { color, size: 7 } } : {}),
           name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
       } else {
         traces.push({ x, y: s.values, type: ttype, mode, yaxis,
-          line: { color, width: 1.5, dash }, marker: dot ? { color, size: 7 } : undefined,
+          line: { color, width: 1.5, dash }, ...(dot ? { marker: { color, size: 7 } } : {}),
           name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
       }
     }
@@ -1264,6 +1264,25 @@ function fillSelect(sel, options, keep) {
   sel.value = prev;
 }
 
+// Run display names often share a long common prefix and differ only in a
+// suffix that the native <select> popup truncates away (so every option looks
+// identical). Trim the shared prefix — cut back to a token boundary — so the
+// distinguishing part leads. Returns "" when there's nothing useful to strip.
+function commonPrefixBoundary(strs) {
+  if (strs.length < 2) return "";
+  let p = strs[0];
+  for (const s of strs) {
+    let i = 0;
+    while (i < p.length && i < s.length && p[i] === s[i]) i++;
+    p = p.slice(0, i);
+    if (!p) return "";
+  }
+  let cut = -1;
+  for (const ch of ["-", "_", "/", "."]) cut = Math.max(cut, p.lastIndexOf(ch));
+  if (cut > 0) p = p.slice(0, cut + 1);
+  return p.length >= 12 ? p : "";
+}
+
 async function refreshDiffRuns() {
   const panel = $("diffpanel");
   if (!panel || panel.classList.contains("collapsed")) return;
@@ -1273,7 +1292,12 @@ async function refreshDiffRuns() {
   try {
     _diffIndex = (await fetch("api/text-index?runs=" + encodeURIComponent(runs.join(","))).then((x) => x.json())).runs || {};
   } catch { _diffIndex = {}; }
-  const runOpts = Object.keys(_diffIndex).map((rid) => ({ value: rid, label: _diffIndex[rid].display_name || rid }));
+  const ids = Object.keys(_diffIndex);
+  const pre = commonPrefixBoundary(ids.map((rid) => _diffIndex[rid].display_name || rid));
+  const runOpts = ids.map((rid) => {
+    const full = _diffIndex[rid].display_name || rid;
+    return { value: rid, label: pre && full.length > pre.length ? "…" + full.slice(pre.length) : full };
+  });
   if (!runOpts.length) {
     for (const s of ["a", "b"]) { fillSelect(dq(s, "run"), []); fillSelect(dq(s, "tag"), []); fillSelect(dq(s, "step"), []); }
     return setEmpty("No text summaries (e.g. config) found in the selected runs.");
@@ -1283,6 +1307,7 @@ async function refreshDiffRuns() {
 
 function populateTags(side, keep) {
   const rid = dq(side, "run").value;
+  dq(side, "run").title = (_diffIndex[rid] && _diffIndex[rid].display_name) || rid;  // full name on hover
   const tags = _diffIndex[rid] ? Object.keys(_diffIndex[rid].tags) : [];
   fillSelect(dq(side, "tag"), tags.map((t) => ({ value: t, label: t })), keep);
   populateSteps(side, keep);
@@ -1453,14 +1478,14 @@ function drawCard(card, series) {
     const mode = dot ? "markers" : "lines";
     if (smoothOn) {
       traces.push({ x, y: s.values, type: ttype, mode,
-        line: { color, width: 0.7 }, marker: dot ? { color, size: 6 } : undefined,
+        line: { color, width: 0.7 }, ...(dot ? { marker: { color, size: 6 } } : {}),
         opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
       traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode,
-        line: { color, width: 1.5 }, marker: dot ? { color, size: 7 } : undefined,
+        line: { color, width: 1.5 }, ...(dot ? { marker: { color, size: 7 } } : {}),
         name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     } else {
       traces.push({ x, y: s.values, type: ttype, mode,
-        line: { color, width: 1.4 }, marker: dot ? { color, size: 7 } : undefined,
+        line: { color, width: 1.4 }, ...(dot ? { marker: { color, size: 7 } } : {}),
         name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
     }
     if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color, ttype);
