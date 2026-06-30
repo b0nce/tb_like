@@ -24,7 +24,6 @@ header {
   border-bottom: 1px solid var(--border);
 }
 header h1 { margin: 0; font-size: 18px; color: var(--accent); }
-.tagline { color: var(--muted); font-size: 12px; }
 .srcpath {
   color: var(--muted); font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

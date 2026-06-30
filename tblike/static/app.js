@@ -555,7 +555,7 @@ function renderTagTree() {
 
   // When the filter or selected-only mode *changes*, auto-expand the groups
   // leading to the shown tags — but only once, so manual expand/collapse sticks.
-  const fkey = filter + " " + (state.showSelectedOnly ? "S" : "");
+  const fkey = filter + "\x00" + (state.showSelectedOnly ? "S" : "");
   if (fkey !== state.lastFilter) {
     state.lastFilter = fkey;
     if (filtering) {
@@ -737,20 +737,23 @@ const fetchSig = () =>
 // instantly. The NARROW zone (state.onscreen) decides which charts actually get
 // drawn.
 //
-// Hybrid SVG/WebGL: data is downsampled server-side (≤max_points), so most
-// charts render fine as SVG `scatter` — which holds NO WebGL context and so can
-// never produce the "broken image" tiles that come from context exhaustion. We
-// only escalate a card to `scattergl` when it carries enough points that SVG
-// would actually drag (GL_POINT_THRESHOLD).
+// SVG `scatter` vs WebGL `scattergl`: benchmarked head-to-head (9-chart grid,
+// vendored Plotly), SVG is 6–40× FASTER than WebGL at every realistic size and
+// barely scales with point count (one line = one <path>): 9 charts redraw in
+// ~50–140ms on SVG, but ~800ms first / ~2200ms redraw on WebGL — its per-chart
+// GPU-context init dominates. WebGL only wins for a single pathological chart
+// (>~150k points), where SVG's path finally gets heavy. So we default to SVG and
+// escalate to WebGL only past a very high per-chart point count — which almost
+// never trips, so few enough GL contexts exist to never exhaust the browser's
+// ~16-context cap (the old 6000 threshold both slowed every multi-run chart AND
+// caused the "broken image" tiles by spawning a GL context per chart).
 //
 // Two distinct caps:
-//  • MAX_RENDERED  — total charts drawn at once (SVG + GL). The cheap SVG default
-//    lets this run high, so lots of plots stay live and redraw-free as you scroll.
-//  • MAX_LIVE_PLOTS — of those, how many may be WebGL. Browsers hard-cap WebGL
-//    contexts at ~16 (Chrome); 64 of *those* is physically impossible and would
-//    bring back the broken tiles, so GL stays rationed to the browser-safe count.
-const GL_POINT_THRESHOLD = 6000;   // total plotted points above which a card uses WebGL
-const MAX_RENDERED = 64;           // total live charts (mostly cheap SVG)
+//  • MAX_RENDERED  — total charts drawn at once (now ~all cheap SVG).
+//  • MAX_LIVE_PLOTS — of those, how many may be WebGL (rare); rationed to the
+//    browser-safe count so the few huge GL charts can't exhaust contexts.
+const GL_POINT_THRESHOLD = 150000; // total plotted points above which a card uses WebGL
+const MAX_RENDERED = 64;           // total live charts (cheap SVG)
 
 // Live WebGL-context budget, scaled to the machine. Weak/integrated GPUs choke
 // well before Chrome's ~16 ceiling, so modest devices get fewer. Computed once.
@@ -884,14 +887,16 @@ function renderOnscreen() {
     keep.add(t);
   }
   for (const t of [...state.live]) if (!keep.has(t)) evictPlot(t);   // purge the rest
-  // Draw at most a few per frame so filling a large render zone (up to 64 cards)
-  // from cache never stalls the main thread — the rest finish on the next frame.
-  let drawn = 0;
+  // Draw within a per-frame time budget rather than a fixed count: a heavy
+  // multi-run chart can cost 10× a light one, so a flat "12 per frame" still
+  // stalls. Draw until ~10ms elapse (always ≥1), then yield to the next frame.
+  const DRAW_MS = 10;
+  const start = performance.now();
   for (const t of keep) {
     const cs = state.cards.get(t), card = $("chart-" + cssId(t));
     if (card && !(cs.drawn && cs.fetchSig === sig)) {
       drawCard(card, cs.series);
-      if (++drawn >= 12) { requestAnimationFrame(renderOnscreen); break; }
+      if (performance.now() - start > DRAW_MS) { requestAnimationFrame(renderOnscreen); break; }
     }
   }
 }
@@ -1779,13 +1784,23 @@ function shareSelection() {
   };
 }
 
-// Redraw the live charts from cached data (style-only changes).
+// Redraw the live charts from cached data (style-only changes), time-budgeted so
+// a smoothing/log-y toggle with many live charts doesn't freeze in one burst.
 function redrawVisible() {
-  for (const tag of [...state.live]) {
-    const cs = state.cards.get(tag);
-    const card = $("chart-" + cssId(tag));
-    if (cs && cs.series && card) drawCard(card, cs.series);
-  }
+  const tags = [...state.live];
+  let i = 0;
+  const step = () => {
+    const start = performance.now();
+    while (i < tags.length) {
+      const tag = tags[i++];
+      const cs = state.cards.get(tag);
+      const card = $("chart-" + cssId(tag));
+      if (cs && cs.series && card) drawCard(card, cs.series);
+      if (performance.now() - start > 10) break;
+    }
+    if (i < tags.length) requestAnimationFrame(step);
+  };
+  step();
   renderOverlay();   // the overlay shares the same style options (logy, step window, x-axis)
 }
 
