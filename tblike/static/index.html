@@ -29,7 +29,9 @@
   <header>
     <h1>tb_like</h1>
     <span class="tagline">columnar TensorBoard — built for many series &amp; many runs</span>
+    <span class="srcpath" id="srcpath" title="source folder this server was launched against"></span>
     <span class="status" id="status">starting…</span>
+    <button id="share-btn" class="refresh-btn" title="Save the current runs, tags & view as a shareable link">⤴ Share selection</button>
     <button id="refresh-btn" class="refresh-btn" title="Re-read selected runs from disk (pick up new events)">↻ Refresh selected</button>
   </header>
 
@@ -98,7 +100,9 @@
       </section>
     </aside>
 
-    <div id="divider" class="divider" title="drag to resize"></div>
+    <div id="divider" class="divider" title="drag to resize">
+      <button id="sidebar-toggle" class="sidebar-toggle" title="hide / show the panel">‹</button>
+    </div>
 
     <main id="charts">
     </main>

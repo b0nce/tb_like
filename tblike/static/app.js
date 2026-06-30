@@ -86,7 +86,10 @@ async function loadRuns() {
     renderRunList();
     $("run-count").textContent = `(${state.runs.length})`;
     idle(`${state.runs.length} runs · select runs to begin`);
-    loadTags();   // pre-populate the tag tree from the first run
+    // A shared selection waiting from the ?sel= URL takes over here (it loads its
+    // own tags); otherwise pre-populate the tree from the first run as a baseline.
+    if (_pendingSel) { const p = _pendingSel; _pendingSel = null; applySelection(p); }
+    else loadTags();
   } catch (e) {
     idle("failed to load runs");
   }
@@ -125,6 +128,16 @@ let _prevReady = -1;
 async function loadStatus() {
   let s;
   try { s = await fetch("api/status").then((x) => x.json()); } catch { return; }
+  // Show the source folder the server was launched against (copyable). Set once.
+  const srcEl = $("srcpath");
+  if (srcEl && s.runs_dir && srcEl.dataset.path !== s.runs_dir) {
+    srcEl.dataset.path = s.runs_dir;
+    srcEl.textContent = "src: " + s.runs_dir;
+    srcEl.title = s.runs_dir;
+    // Tab title = the source folder's last-level name (not the full path).
+    const leaf = s.runs_dir.replace(/[/\\]+$/, "").split(/[/\\]/).pop();
+    document.title = leaf ? `tb_like: ${leaf}` : "tb_like";
+  }
   const p = s.progress || {};
   const processing = !!p.converting || (p.pending || 0) > 0;
   // Persistent background-processing indicator (so runs appearing late is explained).
@@ -827,6 +840,7 @@ function evictPlot(tag) {
   if (card) {
     card.classList.remove("loading");
     card.classList.add("pending-card");
+    card.querySelector(".chart-title")?.remove();   // placeholder shows the cap instead
     if (!card.querySelector(".chart-spinner")) {   // restore the quiet placeholder
       const ph = document.createElement("div");
       ph.className = "chart-spinner quiet";
@@ -889,10 +903,15 @@ function pump() {
 // of cards lands immediately, then the rest fill in over later frames. A token
 // cancels an in-flight build when a newer selection supersedes it.
 let _gridToken = 0;
+// The pinned side panels (overlay + text-diff), always kept last in the charts
+// area, in this order.
+function panelEls() { return [ensureOverlayPanel(), ensureDiffPanel()]; }
+function pinPanels(charts) { for (const p of panelEls()) charts.appendChild(p); }
+
 function renderGrid() {
   const charts = chartsEl();
-  const panel = ensureDiffPanel();            // the text-diff block is pinned last
-  if (panel.parentNode !== charts) charts.appendChild(panel);
+  const panels = panelEls();                  // overlay + text-diff, pinned last
+  for (const p of panels) if (p.parentNode !== charts) charts.appendChild(p);
   // natural sort so layer indices order numerically (layers.2 before layers.10)
   const tags = [...state.selectedTags].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const token = ++_gridToken;                 // any older progressive build now bails
@@ -900,7 +919,7 @@ function renderGrid() {
   if (!state.selectedRuns.size || !tags.length) {
     observer.takeRecords();
     for (const el of [...charts.children]) {
-      if (el === panel) continue;
+      if (panels.includes(el)) continue;
       if (el.dataset && el.dataset.tag) {
         observer.unobserve(el); renderObserver.unobserve(el);
         const pd = document.getElementById("plot-" + cssId(el.dataset.tag));
@@ -912,7 +931,7 @@ function renderGrid() {
     state.visible.clear();
     state.onscreen.clear();
     state.live.clear();
-    charts.appendChild(panel);
+    pinPanels(charts);
     return;
   }
   $("empty")?.remove();
@@ -967,7 +986,7 @@ function renderGrid() {
     }
     if (i < tags.length) { requestAnimationFrame(build); return; }
     // Build complete for this token.
-    charts.appendChild(panel);   // keep the diff panel as the last block
+    pinPanels(charts);   // keep the side panels as the last blocks
     syncGroupHeaders();
     pump();              // fetch data for the wide zone
     renderOnscreen();    // draw any already-cached cards now on-screen
@@ -1017,9 +1036,180 @@ function toggleGroup(g) {
   requestAnimationFrame(() => { pump(); renderOnscreen(); });   // reveal/draw newly shown cards
 }
 
+// ---- graph overlay panel (two tags, independent y-scales) ------------------
+// Plots tag A on the left y-axis and tag B on the right, both across the selected
+// runs, so you can eyeball e.g. learning_rate against max_vio without forcing a
+// shared scale. Color tracks the run; line style tracks the tag (A solid / B
+// dashed) so the two are distinguishable where they cross.
+let _ovA = null, _ovB = null;          // the two tag comboboxes
+let _ovToken = 0;                      // cancels a superseded async render
+const _ovCache = new Map();            // "fetchSig|tag" -> series
+
+// Lightweight filterable combobox over state.tagNames (up to 250k names, so a
+// plain <select>/<datalist> is out — we filter to the first matches as you type).
+function makeTagCombo(onPick) {
+  const wrap = document.createElement("div");
+  wrap.className = "ov-combo";
+  const input = document.createElement("input");
+  input.type = "search";
+  input.className = "ov-input";
+  input.placeholder = "filter tag…";
+  const menu = document.createElement("div");
+  menu.className = "ov-menu";
+  menu.style.display = "none";
+  wrap.append(input, menu);
+  let value = "";
+  const render = () => {
+    const q = input.value.trim().toLowerCase();
+    let names = state.tagNames;
+    if (q) names = names.filter((t) => t.toLowerCase().includes(q));
+    const shown = names.slice(0, 50);
+    menu.innerHTML = shown.map((t) => `<div class="ov-opt" data-tag="${esc(t)}">${esc(t)}</div>`).join("") +
+      (names.length > shown.length ? `<div class="ov-more">+${names.length - shown.length} more — refine</div>` : "") +
+      (shown.length ? "" : `<div class="ov-more">no match</div>`);
+    menu.style.display = "block";
+  };
+  input.addEventListener("focus", render);
+  input.addEventListener("input", render);
+  input.addEventListener("blur", () => setTimeout(() => { menu.style.display = "none"; }, 150));
+  menu.addEventListener("mousedown", (e) => {
+    const opt = e.target.closest(".ov-opt");
+    if (!opt) return;
+    value = opt.dataset.tag;
+    input.value = value;
+    menu.style.display = "none";
+    onPick(value);
+  });
+  return { wrap, get: () => value, set: (v) => { value = v || ""; input.value = value; } };
+}
+
+function ensureOverlayPanel() {
+  let panel = $("overlaypanel");
+  if (panel) return panel;
+  panel = document.createElement("div");
+  panel.id = "overlaypanel";
+  panel.className = "diffpanel ovpanel collapsed";   // reuse the diff-panel chrome
+  panel.innerHTML =
+    `<div class="diff-head"><span class="dcaret">▶</span><span>Graph overlay</span>` +
+    `<span class="dhint">— two tags on one x-axis with independent y-scales (left = A, right = B), across selected runs</span></div>` +
+    `<div class="diff-body">` +
+      `<div class="ov-selectors">` +
+        `<div class="ov-side a"><span class="sidetag">A · left</span></div>` +
+        `<div class="ov-side b"><span class="sidetag">B · right</span></div>` +
+      `</div>` +
+      `<div class="ov-legend"></div>` +
+      `<div class="ov-plot" id="overlayplot" style="display:none"></div>` +
+      `<div class="ov-empty">Pick tag A and tag B to overlay.</div>` +
+    `</div>`;
+  _ovA = makeTagCombo(() => renderOverlay());
+  _ovB = makeTagCombo(() => renderOverlay());
+  panel.querySelector(".ov-side.a").appendChild(_ovA.wrap);
+  panel.querySelector(".ov-side.b").appendChild(_ovB.wrap);
+  panel.querySelector(".diff-head").onclick = () => {
+    const collapsed = panel.classList.toggle("collapsed");
+    panel.querySelector(".dcaret").textContent = collapsed ? "▶" : "▼";
+    if (!collapsed) renderOverlay();
+  };
+  return panel;
+}
+
+async function ovSeries(tag) {
+  const key = fetchSig() + "|" + tag;
+  if (_ovCache.has(key)) return _ovCache.get(key);
+  const resp = await fetch("api/series", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: [...state.selectedRuns], tags: [tag], max_points: optMaxPoints() }),
+  }).then((x) => x.json()).catch(() => ({ series: [] }));
+  const series = resp.series || [];
+  _ovCache.set(key, series);
+  return series;
+}
+
+async function renderOverlay() {
+  const panel = $("overlaypanel");
+  if (!panel || panel.classList.contains("collapsed")) return;
+  const empty = panel.querySelector(".ov-empty");
+  const legend = panel.querySelector(".ov-legend");
+  const plotEl = $("overlayplot");
+  const tagA = _ovA.get(), tagB = _ovB.get();
+  const setEmpty = (m) => {
+    empty.textContent = m; empty.style.display = "block"; legend.innerHTML = "";
+    plotEl.style.display = "none";
+    if (plotEl._fullLayout) { try { Plotly.purge(plotEl); } catch {} }
+  };
+  if (!state.selectedRuns.size) return setEmpty("Select runs to overlay.");
+  if (!tagA || !tagB) return setEmpty("Pick tag A and tag B to overlay.");
+
+  const token = ++_ovToken;
+  empty.style.display = "none";
+  const [sa, sb] = await Promise.all([ovSeries(tagA), ovSeries(tagB)]);
+  if (token !== _ovToken) return;                       // a newer render superseded us
+  if (!sa.length && !sb.length) return setEmpty("No data for these tags in the selected runs.");
+
+  const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
+  const ttype = seriesPointTotal([...sa, ...sb], smoothOn) > GL_POINT_THRESHOLD ? "scattergl" : "scatter";
+  const traces = [];
+  // Same treatment as the chart cards: optional faint raw underlay + smoothed line.
+  const addSide = (series, yaxis, dash, label) => {
+    const view = stepLimited(series);
+    for (const s of view) {
+      const x = xaxis === "wall_time" ? s.wall_time.map((w) => (w - s.wall_time[0]) / 60.0) : s.steps;
+      const color = colorFor(s.run_id);
+      const nm = `${s.display_name} · ${label}`;
+      if (smoothOn) {
+        traces.push({ x, y: s.values, type: ttype, mode: "lines", yaxis,
+          line: { color, width: 0.7, dash }, opacity: 0.13, hoverinfo: "skip", showlegend: false, name: nm });
+        traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode: "lines", yaxis,
+          line: { color, width: 1.5, dash }, name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
+      } else {
+        traces.push({ x, y: s.values, type: ttype, mode: "lines", yaxis,
+          line: { color, width: 1.5, dash }, name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
+      }
+    }
+    return view;
+  };
+  const viewA = addSide(sa, "y", "solid", "A");
+  const viewB = addSide(sb, "y2", "dot", "B");
+
+  // Outlier clipping is per-axis (each tag has its own scale).
+  const clipA = optOutliers() ? outlierRange(viewA, logy) : null;
+  const clipB = optOutliers() ? outlierRange(viewB, logy) : null;
+  const yA = { title: { text: tagA, font: { size: 10 } }, type: logy ? "log" : "linear", gridcolor: "#2a313c", zeroline: false };
+  if (clipA) { yA.range = clipA; yA.autorange = false; }
+  const yB = { title: { text: tagB, font: { size: 10 } }, type: logy ? "log" : "linear", overlaying: "y", side: "right", showgrid: false, zeroline: false };
+  if (clipB) { yB.range = clipB; yB.autorange = false; }
+
+  const win = stepRangeActive();
+  const xAxisObj = { title: xaxis === "wall_time" ? "min" : "step", gridcolor: "#2a313c", zeroline: false };
+  if (win && xaxis === "step") { xAxisObj.range = win; xAxisObj.autorange = false; }
+  const layout = {
+    margin: { l: 58, r: 58, t: 8, b: 36 },
+    paper_bgcolor: "#161b22", plot_bgcolor: "#161b22", font: { color: "#d7dde5", size: 10 },
+    xaxis: xAxisObj,
+    yaxis: yA,
+    yaxis2: yB,
+    showlegend: false,
+    hovermode: "x unified",
+    hoverlabel: { namelength: 40, font: { size: 10 }, bgcolor: "#0f1419" },
+  };
+  plotEl.style.display = "";
+  Plotly.react("overlayplot", traces, layout, { responsive: true, displaylogo: false });
+  // Legend: line-style → tag, then a color → run key (the colors aren't otherwise
+  // labelled here, unlike the chart cards which carry a Plotly legend).
+  const runMap = new Map();
+  for (const s of [...sa, ...sb]) if (!runMap.has(s.run_id)) runMap.set(s.run_id, s.display_name);
+  const runKeys = [...runMap].map(([rid, name]) =>
+    `<span class="ov-key" title="${esc(name)}"><span class="ov-dot" style="background:${colorFor(rid)}"></span>` +
+    `<span class="ov-runname">${esc(name)}</span></span>`).join("");
+  legend.innerHTML =
+    `<span class="ov-key"><span class="ov-swatch solid"></span>A · ${esc(tagA)} <em>(left)</em></span>` +
+    `<span class="ov-key"><span class="ov-swatch dashed"></span>B · ${esc(tagB)} <em>(right)</em></span>` +
+    `<span class="ov-sep"></span>` + runKeys;
+}
+
 // ---- text-diff panel (always the last block in the charts area) ------------
-const _textCache = new Map();   // "run|tag|step" -> text
-let _diffIndex = {};            // {run_id: {display_name, tags: {tag: [{step, chars}]}}}
+const _textCache = new Map();   // "run|tag|i" -> text
+let _diffIndex = {};            // {run_id: {display_name, tags: {tag: [{i, step, wall_time, chars}]}}}
 const dq = (side, which) => $("diffpanel").querySelector(`.diff-side.${side} .d-${which}`);
 
 function ensureDiffPanel() {
@@ -1088,20 +1278,30 @@ function populateTags(side, keep) {
 function populateSteps(side, keep) {
   const rid = dq(side, "run").value, tag = dq(side, "tag").value;
   const entries = (_diffIndex[rid] && _diffIndex[rid].tags[tag]) || [];
-  fillSelect(dq(side, "step"),
-    entries.map((e) => ({ value: String(e.step), label: `step ${e.step} (${e.chars} chars)` })), keep);
+  // Several entries can share a step (distinct texts at the same step), so the
+  // option *value* is the entry id; the label disambiguates duplicate steps.
+  const counts = {};
+  for (const e of entries) counts[e.step] = (counts[e.step] || 0) + 1;
+  const seen = {};
+  const opts = entries.map((e) => {
+    let label = `step ${e.step} (${e.chars} chars)`;
+    if (counts[e.step] > 1) { seen[e.step] = (seen[e.step] || 0) + 1; label = `step ${e.step} #${seen[e.step]} (${e.chars} chars)`; }
+    return { value: String(e.i), label };
+  });
+  fillSelect(dq(side, "step"), opts, keep);
   renderDiff();
 }
 
-async function getText(rid, tag, step) {
-  const key = `${rid}|${tag}|${step}`;
+async function getText(rid, tag, i) {
+  const key = `${rid}|${tag}|${i}`;
   if (_textCache.has(key)) return _textCache.get(key);
-  const r = await fetch(`api/text?run=${encodeURIComponent(rid)}&tag=${encodeURIComponent(tag)}&step=${encodeURIComponent(step)}`)
+  const r = await fetch(`api/text?run=${encodeURIComponent(rid)}&tag=${encodeURIComponent(tag)}&i=${encodeURIComponent(i)}`)
     .then((x) => x.json()).catch(() => ({ text: "" }));
   _textCache.set(key, r.text || "");
   return r.text || "";
 }
 
+// `step` here carries the selected entry id (the <option> value), not a raw step.
 const diffPick = (side) => ({ run: dq(side, "run").value, tag: dq(side, "tag").value, step: dq(side, "step").value });
 
 async function renderDiff() {
@@ -1212,6 +1412,17 @@ function drawCard(card, series) {
   const plotDiv = $("plot-" + cssId(tag));
   if (plotDiv) plotDiv.style.display = "";
 
+  // Render the tag name as real HTML (selectable/copyable) above the plot, rather
+  // than Plotly's SVG title which can't be selected. Created once per card.
+  let titleEl = card.querySelector(".chart-title");
+  if (!titleEl) {
+    titleEl = document.createElement("div");
+    titleEl.className = "chart-title";
+    card.insertBefore(titleEl, plotDiv || null);
+  }
+  titleEl.textContent = tag;
+  titleEl.title = tag;
+
   const view = stepLimited(series);
   const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
   // SVG by default (no WebGL context — immune to context exhaustion / broken
@@ -1247,8 +1458,9 @@ function drawCard(card, series) {
   if (win && xaxis === "step") { xAxisObj.range = win; xAxisObj.autorange = false; }
 
   const layout = {
-    title: { text: tag, font: { size: 13 }, x: 0.01 },
-    margin: { l: 48, r: 10, t: 28, b: 32 },
+    // Title is rendered as HTML (.chart-title) above the plot so it's selectable;
+    // no Plotly SVG title here, so the top margin can be tight.
+    margin: { l: 48, r: 10, t: 8, b: 32 },
     paper_bgcolor: "#161b22", plot_bgcolor: "#161b22",
     font: { color: "#d7dde5", size: 10 },
     xaxis: xAxisObj,
@@ -1360,6 +1572,7 @@ async function refreshSelected() {
     for (const cs of state.cards.values()) { cs.fetchSig = null; cs.series = null; }  // invalidate cache
     purgeRenderedCharts();                             // force a clean Plotly rebuild
     pump();                                            // refetch + redraw what's on screen
+    _ovCache.clear(); renderOverlay();                 // overlay data may have changed on disk
     _textCache.clear(); refreshDiffRuns();             // text summaries may have changed
     loadRuns();                                        // refresh run row stats
     idle(`refreshed ${r.refreshed.length} run(s) · +${(r.new_rows || 0).toLocaleString()} rows`);
@@ -1372,6 +1585,96 @@ async function refreshSelected() {
 
 function updateRefreshBtn() { $("refresh-btn").disabled = !state.selectedRuns.size; }
 
+// ---- shareable named selections --------------------------------------------
+// Snapshot the current runs + tags + view options into a payload the server can
+// persist, and restore one such payload on load (from the ?sel= URL).
+let _pendingSel = null;   // selection fetched at boot, applied once runs are known
+
+function selectionPayload() {
+  const op = $("overlaypanel");
+  return {
+    runs: [...state.selectedRuns],
+    tags: [...state.selectedTags],
+    view: {
+      maxPoints: optMaxPoints(), xaxis: optXaxis(),
+      smoothOn: optSmoothOn(), weight: optWeight(), logy: optLogy(),
+      outliers: optOutliers(), qLow: optQLow(), qHigh: optQHigh(),
+      stepLo: state.stepRange.lo, stepHi: state.stepRange.hi,
+    },
+    overlay: {
+      a: _ovA ? _ovA.get() : "",
+      b: _ovB ? _ovB.get() : "",
+      open: !!(op && !op.classList.contains("collapsed")),
+    },
+  };
+}
+
+async function applySelection(payload) {
+  if (!payload) return;
+  const v = payload.view || {};
+  // Restore the view inputs first (so the grid renders with the right options).
+  if (v.maxPoints != null) $("max-points").value = v.maxPoints;
+  if (v.xaxis) $("xaxis").value = v.xaxis;
+  if (v.smoothOn != null) $("smooth-on").checked = !!v.smoothOn;
+  if (v.weight != null) $("smooth").value = v.weight;
+  if (v.logy != null) $("logy").checked = !!v.logy;
+  if (v.outliers != null) $("outliers-on").checked = !!v.outliers;
+  if (v.qLow != null) $("q-low").value = v.qLow;
+  if (v.qHigh != null) $("q-high").value = v.qHigh;
+  updateQReadout();
+  // Runs/tags may have changed since the link was made — apply the intersection.
+  const haveRuns = new Set(state.runs.map((r) => r.run_id));
+  state.selectedRuns = new Set((payload.runs || []).filter((r) => haveRuns.has(r)));
+  renderRunList();
+  updateRefreshBtn();
+  await loadTags(true);                       // load tags for exactly these runs
+  const haveTags = new Set(state.tagNames);
+  state.selectedTags = new Set((payload.tags || []).filter((t) => haveTags.has(t)));
+  if (v.stepLo != null) state.stepRange.lo = v.stepLo;
+  if (v.stepHi != null) state.stepRange.hi = v.stepHi;
+  syncStepSlider();
+  updatePending();
+  renderTagTree();
+  renderGrid();                                // ensures the overlay panel exists
+  refreshDiffRuns();
+  // Restore the graph-overlay picks and open state.
+  const ov = payload.overlay || {};
+  ensureOverlayPanel();
+  if (_ovA) _ovA.set(ov.a || "");
+  if (_ovB) _ovB.set(ov.b || "");
+  const op = $("overlaypanel");
+  if (op) {
+    const collapsed = op.classList.contains("collapsed");
+    if (ov.open && collapsed) { op.classList.remove("collapsed"); op.querySelector(".dcaret").textContent = "▼"; }
+    else if (!ov.open && !collapsed) { op.classList.add("collapsed"); op.querySelector(".dcaret").textContent = "▶"; }
+  }
+  renderOverlay();
+  idle(`restored selection: ${payload.name || "shared"}`);
+}
+
+async function shareSelection() {
+  if (!state.selectedRuns.size && !state.selectedTags.size) {
+    idle("nothing selected to share");
+    return;
+  }
+  const name = prompt("Name this selection (used in the share link):");
+  if (!name) return;
+  busy("creating share link…");
+  try {
+    const r = await fetch("api/selections", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, ...selectionPayload() }),
+    }).then((x) => x.json());
+    const url = new URL(document.baseURI);
+    url.searchParams.set("sel", r.id);
+    const link = url.toString();
+    try { await navigator.clipboard.writeText(link); idle("share link copied ✓ — " + link); }
+    catch { window.prompt("Share link:", link); idle("share link ready"); }
+  } catch (e) {
+    idle("failed to create share link");
+  }
+}
+
 // Redraw the live charts from cached data (style-only changes).
 function redrawVisible() {
   for (const tag of [...state.live]) {
@@ -1379,13 +1682,16 @@ function redrawVisible() {
     const card = $("chart-" + cssId(tag));
     if (cs && cs.series && card) drawCard(card, cs.series);
   }
+  renderOverlay();   // the overlay shares the same style options (logy, step window, x-axis)
 }
 
 // Invalidate cached series (refetch-affecting change) and reload via the queue.
 function reloadVisible() {
   for (const cs of state.cards.values()) { cs.fetchSig = null; cs.drawn = false; }
+  _ovCache.clear();   // overlay series depend on runs/max_points/x-axis too
   pump();
   renderOnscreen();   // drop now-stale plots; fresh ones redraw as fetches land
+  renderOverlay();
 }
 
 const scheduleGrid = debounce(renderGrid, 150);
@@ -1502,6 +1808,7 @@ for (const id of ["max-points", "xaxis"]) {
   const clampX = (x) => Math.max(MIN, Math.min(MAX(), x));
 
   divider.addEventListener("mousedown", (e) => {
+    if (document.body.classList.contains("sidebar-collapsed")) return;  // nothing to resize
     e.preventDefault();
     dragging = true;
     document.body.classList.add("dragging");
@@ -1526,13 +1833,40 @@ for (const id of ["max-points", "xaxis"]) {
   });
 })();
 
+// Collapse/expand the left panel so only the charts show. The toggle lives on the
+// divider; stop its mousedown from starting a resize-drag.
+(function initSidebarToggle() {
+  const btn = $("sidebar-toggle");
+  if (!btn) return;
+  btn.addEventListener("mousedown", (e) => e.stopPropagation());
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const collapsed = document.body.classList.toggle("sidebar-collapsed");
+    btn.textContent = collapsed ? "›" : "‹";
+    btn.title = collapsed ? "show the panel" : "hide the panel";
+    window.dispatchEvent(new Event("resize"));   // relayout Plotly to the new width
+  });
+})();
+
 $("refresh-btn").onclick = refreshSelected;
+$("share-btn").onclick = shareSelection;
 
 trackScroll(chartsEl());
 trackScroll(window);
-loadRuns();
 updatePending();
 updateRefreshBtn();
 renderGrid();
-loadStatus();
-setInterval(loadStatus, 3000);
+
+// If the URL carries ?sel=<id>, fetch that saved selection BEFORE anything that
+// loads runs (loadRuns applies it; loadStatus can also trigger loadRuns), so the
+// pending selection is always set first; otherwise just load runs normally.
+(async function boot() {
+  const sel = new URLSearchParams(location.search).get("sel");
+  if (sel) {
+    try { _pendingSel = await fetch("api/selections/" + encodeURIComponent(sel)).then((x) => x.ok ? x.json() : null); }
+    catch { _pendingSel = null; }
+  }
+  loadRuns();
+  loadStatus();
+  setInterval(loadStatus, 3000);
+})();

@@ -301,24 +301,33 @@ class Store:
 
     def text_index(self, run_ids: list[str]) -> dict:
         """Available text entries per run, WITHOUT the bodies:
-        {run_id: {display_name, tags: {tag: [{step, wall_time, chars}]}}}."""
+        {run_id: {display_name, tags: {tag: [{i, step, wall_time, chars}]}}}.
+
+        ``i`` is the entry's stable id (its position in the tag's list); pass it to
+        :meth:`get_text`. Several entries may share a ``step`` (distinct texts logged
+        at the same step), so the id — not the step — addresses a body."""
         out: dict = {}
         for rid in run_ids:
-            texts = self._texts(rid)
+            texts = self._texts(rid)   # canonical list shape (see convert.load_texts)
             if not texts:
                 continue
             idx = self._index(rid) or {}
             tag_map = {}
-            for tag, by_step in texts.items():
-                entries = [
-                    {"step": int(s), "wall_time": e.get("wall_time", 0.0), "chars": len(e.get("text", ""))}
-                    for s, e in by_step.items()
+            for tag, entries in texts.items():
+                tag_map[tag] = [
+                    {"i": i, "step": int(e.get("step", 0)),
+                     "wall_time": e.get("wall_time", 0.0), "chars": len(e.get("text", ""))}
+                    for i, e in enumerate(entries)
                 ]
-                entries.sort(key=lambda x: x["step"])
-                tag_map[tag] = entries
             out[rid] = {"display_name": idx.get("display_name", rid), "tags": tag_map}
         return out
 
-    def get_text(self, run_id: str, tag: str, step: int) -> str | None:
-        entry = self._texts(run_id).get(tag, {}).get(str(step))
-        return entry.get("text") if entry else None
+    def get_text(self, run_id: str, tag: str, i: int) -> str | None:
+        entries = self._texts(run_id).get(tag) or []
+        if 0 <= i < len(entries):
+            return entries[i].get("text")
+        # Legacy fallback: an old client may pass a step value rather than an id.
+        for e in entries:
+            if int(e.get("step", -1)) == i:
+                return e.get("text")
+        return None

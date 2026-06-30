@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.gzip import GZipMiddleware
 
-from .convert import backfill_texts, convert_run
+from .convert import _atomic_write_json, backfill_texts, convert_run
 from .store import Store
 from .watcher import Watcher
 
@@ -26,6 +28,19 @@ class SeriesRequest(BaseModel):
 
 class RefreshRequest(BaseModel):
     run_ids: list[str]
+
+
+class SelectionRequest(BaseModel):
+    name: str
+    runs: list[str] = []
+    tags: list[str] = []
+    view: dict = {}
+    overlay: dict = {}
+
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return s[:80] or "selection"
 
 
 def create_app(
@@ -51,6 +66,8 @@ def create_app(
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.state.store = store
     app.state.watcher = watcher
+    app.state.runs_dir = os.path.abspath(runs_dir)
+    app.state.cache_dir = os.path.abspath(cache_dir)
 
     @app.get("/api/runs")
     def get_runs():
@@ -81,11 +98,14 @@ def create_app(
         return {"runs": store.text_index(run_ids)}
 
     @app.get("/api/text")
-    def get_text(run: str, tag: str, step: int):
-        text = store.get_text(run, tag, step)
+    def get_text(run: str, tag: str, i: int = -1, step: int = -1):
+        # `i` is the entry id from /api/text-index (several texts can share a step);
+        # `step` is kept as a legacy fallback for older clients.
+        ref = i if i >= 0 else step
+        text = store.get_text(run, tag, ref)
         if text is None:
             raise HTTPException(404, "text not found")
-        return {"run": run, "tag": tag, "step": step, "text": text}
+        return {"run": run, "tag": tag, "i": ref, "text": text}
 
     @app.post("/api/refresh")
     def post_refresh(req: RefreshRequest):
@@ -112,12 +132,43 @@ def create_app(
                 raise HTTPException(500, f"refresh failed for {rid}: {e}")
         return {"refreshed": refreshed, "new_rows": new_rows, "text_backfilled": text_added}
 
+    @app.post("/api/selections")
+    def post_selection(req: SelectionRequest):
+        # Persist a named selection (runs + tags + view options) under
+        # cache/_shared/<slug>.json so it can be restored from a short ?sel= URL.
+        if len(req.tags) > 500_000:
+            raise HTTPException(400, "selection too large")
+        shared = os.path.join(app.state.cache_dir, "_shared")
+        os.makedirs(shared, exist_ok=True)
+        base = _slugify(req.name)
+        sid, n = base, 2
+        while os.path.exists(os.path.join(shared, sid + ".json")):
+            sid = f"{base}-{n}"
+            n += 1
+        payload = {"id": sid, "name": req.name, "runs": req.runs, "tags": req.tags,
+                   "view": req.view, "overlay": req.overlay}
+        _atomic_write_json(os.path.join(shared, sid + ".json"), payload)
+        return {"id": sid, "name": req.name}
+
+    @app.get("/api/selections/{sid}")
+    def get_selection(sid: str):
+        # basename() defangs any path-traversal attempt in the id.
+        p = os.path.join(app.state.cache_dir, "_shared", os.path.basename(sid) + ".json")
+        if not os.path.exists(p):
+            raise HTTPException(404, "selection not found")
+        try:
+            with open(p) as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            raise HTTPException(500, "selection unreadable")
+
     @app.get("/api/status")
     def get_status():
         return {
             "watcher": watcher.last_scan,
             "progress": watcher.progress,
             "num_runs": len(store.run_ids()),
+            "runs_dir": app.state.runs_dir,
         }
 
     @app.get("/")

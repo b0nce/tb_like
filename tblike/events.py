@@ -11,7 +11,6 @@ many records we have already consumed, so a re-scan only emits new data.
 
 from __future__ import annotations
 
-import glob
 import mmap
 import os
 import struct
@@ -107,9 +106,42 @@ class RunIngestState:
         return {"files": {n: {"size": fs.size, "records": fs.records} for n, fs in self.files.items()}}
 
 
+def discover_event_files(run_dir: str) -> list[tuple[str, str, str]]:
+    """All event files under a run, at any depth, as ``(path, prefix, relkey)``.
+
+    A run's events may live not only at its top level but in nested subfolders
+    (e.g. ``metrics/sub/events.out.tfevents.autometrics``). We walk the whole run
+    and merge those into the same run, namespacing their tags by the subpath:
+
+      * ``prefix`` — the file's directory relative to ``run_dir`` (``""`` at the
+        top level), prepended to each tag so nested series read ``metrics/sub/loss``
+        and never collide with a top-level ``loss``.
+      * ``relkey`` — the file's path relative to ``run_dir`` (forward-slashed),
+        used as the per-file ingest-state key. Two nested files can share a
+        basename (``events.out.tfevents.autometrics`` in different subdirs), so the
+        relative path — not the basename — must key the ingest bookkeeping. For a
+        top-level file ``relkey == basename``, keeping old caches valid.
+
+    Sorted by ``relkey`` for stable, monotonic ordering. Symlinks are NOT followed
+    (avoids loops; matches the sdist's symlink-dir caveat).
+    """
+    out: list[tuple[str, str, str]] = []
+    for dirpath, _dirs, files in os.walk(run_dir, followlinks=False):
+        for name in files:
+            if not name.startswith("events.out.tfevents."):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(dirpath, run_dir)
+            prefix = "" if rel == "." else rel.replace(os.sep, "/")
+            relkey = os.path.relpath(path, run_dir).replace(os.sep, "/")
+            out.append((path, prefix, relkey))
+    out.sort(key=lambda t: t[2])
+    return out
+
+
 def list_event_files(run_dir: str) -> list[str]:
-    """Event files for a run, sorted by name (their suffix is monotonic)."""
-    return sorted(glob.glob(os.path.join(run_dir, EVENT_GLOB)))
+    """Event-file paths for a run (recursive), sorted by relative path."""
+    return [p for p, _prefix, _relkey in discover_event_files(run_dir)]
 
 
 def _decode_scalar(value) -> float | None:
@@ -143,33 +175,40 @@ def _decode_text(value) -> str | None:
     return "\n".join(parts)
 
 
-def plan_files(run_dir: str, state: RunIngestState) -> tuple[list[tuple[str, int]], int]:
+def plan_files(run_dir: str, state: RunIngestState) -> tuple[list[tuple[str, int, str, str]], int]:
     """Decide which event files need (re)parsing for an incremental pass.
 
-    Returns ``(tasks, n_total)`` where each task is ``(path, already_records)``
-    for a new/grown file, and ``n_total`` is the full event-file count (so a
-    progress bar can also account for the cheaply skipped, unchanged files).
+    Returns ``(tasks, n_total)`` where each task is
+    ``(path, already_records, prefix, relkey)`` for a new/grown file, and
+    ``n_total`` is the full event-file count (so a progress bar can also account
+    for the cheaply skipped, unchanged files). ``prefix``/``relkey`` come from
+    :func:`discover_event_files` (nested-file namespacing + ingest key).
     """
-    tasks: list[tuple[str, int]] = []
-    files = list_event_files(run_dir)
-    for path in files:
+    tasks: list[tuple[str, int, str, str]] = []
+    files = discover_event_files(run_dir)
+    for path, prefix, relkey in files:
         try:
             size = os.path.getsize(path)
         except OSError:
             continue
-        fs = state.files.get(os.path.basename(path))
+        fs = state.files.get(relkey)
         if fs is not None and size <= fs.size:
             continue  # unchanged -> nothing new
-        tasks.append((path, fs.records if fs is not None else 0))
+        tasks.append((path, fs.records if fs is not None else 0, prefix, relkey))
     return tasks, len(files)
 
 
-def parse_file(path: str, already: int = 0) -> dict:
+def parse_file(path: str, already: int = 0, prefix: str = "", key: str | None = None) -> dict:
     """Parse one event file, skipping the first ``already`` records.
 
     Top-level and picklable so it can run in a joblib worker process. Returns
     a columnar dict; the caller updates ingest state from ``size``/``records``.
+
+    ``prefix`` namespaces every tag (``"<prefix>/<tag>"``) for nested event files;
+    ``key`` is the ingest-state key returned as ``name`` (defaults to the basename
+    for top-level files). See :func:`discover_event_files`.
     """
+    pre = (prefix + "/") if prefix else ""
     tags: list[str] = []
     steps: list[int] = []
     walls: list[float] = []
@@ -188,20 +227,20 @@ def parse_file(path: str, already: int = 0) -> dict:
         for v in ev.summary.value:
             val = _decode_scalar(v)
             if val is not None:
-                tags.append(v.tag)
+                tags.append(pre + v.tag)
                 steps.append(int(ev.step))
                 walls.append(float(ev.wall_time))
                 vals.append(val)
                 continue
             txt = _decode_text(v)
             if txt is not None:
-                texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
+                texts.append((pre + v.tag, int(ev.step), float(ev.wall_time), txt))
     try:
         size = os.path.getsize(path)
     except OSError:
         size = 0
     return {
-        "name": os.path.basename(path),
+        "name": key if key is not None else os.path.basename(path),
         "size": size,
         "records": seen,
         "tags": tags,
@@ -212,7 +251,8 @@ def parse_file(path: str, already: int = 0) -> dict:
     }
 
 
-def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
+def parse_texts(path: str, head_records: int = 512, gap: int = 512,
+                prefix: str = "", key: str | None = None) -> dict:
     """Scan one event file for text summaries only (e.g. a logged config).
 
     Top-level/picklable for joblib. Ignores ingest state and scalars entirely,
@@ -226,6 +266,7 @@ def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
     ``head_records=0`` and ``gap=0`` for an exhaustive scan. Returns
     ``{"name", "texts": [(tag, step, wall_time, text), ...]}``.
     """
+    pre = (prefix + "/") if prefix else ""
     texts: list[tuple[str, int, float, str]] = []
     seen = since = 0
     found = False
@@ -239,7 +280,7 @@ def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
             for v in ev.summary.value:
                 txt = _decode_text(v)
                 if txt is not None:
-                    texts.append((v.tag, int(ev.step), float(ev.wall_time), txt))
+                    texts.append((pre + v.tag, int(ev.step), float(ev.wall_time), txt))
                     got = True
         if got:
             found, since = True, 0
@@ -249,7 +290,7 @@ def parse_texts(path: str, head_records: int = 512, gap: int = 512) -> dict:
             break  # no text in this file's head -> assume none (scalar-only file)
         if gap and found and since >= gap:
             break  # passed the text block at the file's start
-    return {"name": os.path.basename(path), "texts": texts}
+    return {"name": key if key is not None else os.path.basename(path), "texts": texts}
 
 
 def iter_new_scalars(run_dir: str, state: RunIngestState, on_file=None) -> Iterator[ScalarRow]:
@@ -265,20 +306,20 @@ def iter_new_scalars(run_dir: str, state: RunIngestState, on_file=None) -> Itera
     `on_file(done, total, basename)` is called after each event file is handled,
     enabling a progress bar.
     """
-    files = list_event_files(run_dir)
+    files = discover_event_files(run_dir)
     total = len(files)
-    for fi, path in enumerate(files):
-        name = os.path.basename(path)
+    for fi, (path, prefix, relkey) in enumerate(files):
+        pre = (prefix + "/") if prefix else ""
         try:
             size = os.path.getsize(path)
         except OSError:
             if on_file:
-                on_file(fi + 1, total, name)
+                on_file(fi + 1, total, relkey)
             continue
-        fs = state.files.get(name)
+        fs = state.files.get(relkey)
         if fs is not None and size <= fs.size:
             if on_file:
-                on_file(fi + 1, total, name)  # nothing new in this file
+                on_file(fi + 1, total, relkey)  # nothing new in this file
             continue
 
         already = fs.records if fs is not None else 0
@@ -296,7 +337,7 @@ def iter_new_scalars(run_dir: str, state: RunIngestState, on_file=None) -> Itera
                 val = _decode_scalar(v)
                 if val is None:
                     continue
-                yield ScalarRow(tag=v.tag, step=int(ev.step), wall_time=float(ev.wall_time), value=val)
-        state.files[name] = FileState(size=size, records=seen)
+                yield ScalarRow(tag=pre + v.tag, step=int(ev.step), wall_time=float(ev.wall_time), value=val)
+        state.files[relkey] = FileState(size=size, records=seen)
         if on_file:
-            on_file(fi + 1, total, name)
+            on_file(fi + 1, total, relkey)

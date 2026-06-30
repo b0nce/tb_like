@@ -25,6 +25,7 @@ import polars as pl
 from .events import (
     FileState,
     RunIngestState,
+    discover_event_files,
     list_event_files,
     parse_file,
     parse_texts,
@@ -94,9 +95,35 @@ def _load_texts(cache_run_dir: str) -> dict:
         return {}
 
 
+def normalize_texts(texts: dict) -> dict:
+    """Coerce texts.json to the canonical ``{tag: [{step, wall_time, text}, ...]}``
+    shape, accepting the legacy ``{tag: {step: {wall_time, text}}}`` dict too.
+
+    The list shape lets a tag hold several *distinct* texts logged at the SAME step
+    (e.g. two configs both at step 0) — the old dict keyed by step silently dropped
+    all but the last. Each entry's position in the list is its stable id.
+    """
+    out: dict[str, list] = {}
+    for tag, by in texts.items():
+        if isinstance(by, list):
+            out[tag] = by
+            continue
+        entries = [
+            {"step": int(s), "wall_time": e.get("wall_time", 0.0), "text": e.get("text", "")}
+            for s, e in by.items()
+        ]
+        entries.sort(key=lambda x: x["step"])
+        out[tag] = entries
+    return out
+
+
 def load_texts(cache_run_dir: str) -> dict:
-    """Public read of a run's text summaries: {tag: {step: {wall_time, text}}}."""
-    return _load_texts(cache_run_dir)
+    """Public read of a run's text summaries: {tag: [{step, wall_time, text}, ...]}.
+
+    Normalizes legacy on-disk caches (dict keyed by step) on read, so existing
+    caches keep working without a rebuild.
+    """
+    return normalize_texts(_load_texts(cache_run_dir))
 
 
 def load_tag_names(cache_run_dir: str) -> list[str] | None:
@@ -222,20 +249,23 @@ def _merge_tag_stats(existing: dict, df: pl.DataFrame) -> dict:
 
 
 def _dedup_texts(raw: list[tuple]) -> dict:
-    """Fold (tag, step, wall, text) tuples into {tag: {step: {wall_time, text}}},
-    keeping only entries where the text *changes* — a config repeated across
-    every step collapses to a single entry (its first occurrence)."""
+    """Fold (tag, step, wall, text) tuples into ``{tag: [{step, wall_time, text}]}``.
+
+    Collapses only *consecutive identical* text — a config repeated across every
+    step still folds to one entry — but keeps DISTINCT texts even when they share a
+    step (two configs both at step 0 become two list entries, so both can be
+    diffed). Stable-sorted by step, so same-step entries keep their logged order."""
     by_tag: dict[str, list[tuple]] = {}
     for tag, step, wall, text in raw:
         by_tag.setdefault(tag, []).append((step, wall, text))
-    out: dict[str, dict] = {}
+    out: dict[str, list] = {}
     for tag, items in by_tag.items():
-        items.sort(key=lambda x: x[0])
-        kept: dict[str, dict] = {}
+        items.sort(key=lambda x: x[0])   # stable: same-step order preserved
+        kept: list[dict] = []
         last = None
         for step, wall, text in items:
             if text != last:
-                kept[str(step)] = {"wall_time": wall, "text": text}
+                kept.append({"step": int(step), "wall_time": wall, "text": text})
                 last = text
         out[tag] = kept
     return out
@@ -268,7 +298,7 @@ def backfill_texts(
     if _load_texts(cache_run_dir) and not force:
         return -1  # already has text — skip the re-scan
 
-    files = list_event_files(run_dir)
+    files = discover_event_files(run_dir)
     total = len(files)
     done = 0
     raw: list[tuple] = []
@@ -282,13 +312,14 @@ def backfill_texts(
             on_file(done, total, res["name"])
 
     if n_jobs == 1:
-        for path in files:
-            handle(parse_texts(path, *scan))
+        for path, prefix, key in files:
+            handle(parse_texts(path, *scan, prefix=prefix, key=key))
     else:
         from joblib import Parallel, delayed
 
         gen = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
-            delayed(parse_texts)(path, *scan) for path in files
+            delayed(parse_texts)(path, *scan, prefix=prefix, key=key)
+            for path, prefix, key in files
         )
         for res in gen:
             handle(res)
@@ -357,13 +388,14 @@ def convert_run(
 
     if tasks:
         if n_jobs == 1:
-            for path, already in tasks:
-                handle(parse_file(path, already))
+            for path, already, prefix, key in tasks:
+                handle(parse_file(path, already, prefix, key))
         else:
             from joblib import Parallel, delayed
 
             gen = Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
-                delayed(parse_file)(path, already) for path, already in tasks
+                delayed(parse_file)(path, already, prefix, key)
+                for path, already, prefix, key in tasks
             )
             for res in gen:
                 handle(res)
@@ -394,10 +426,11 @@ def convert_run(
     texts = _load_texts(cache_run_dir)
     if new_texts:
         # Fold new text in, de-duplicating repeats: a config logged every step
-        # collapses to one entry per change (across passes too).
+        # collapses to one entry per change (across passes too). normalize_texts
+        # accepts both the legacy dict and the current list shape on disk.
         prior = [
-            (tag, int(step), e.get("wall_time", 0.0), e.get("text", ""))
-            for tag, by in texts.items() for step, e in by.items()
+            (tag, int(e["step"]), e.get("wall_time", 0.0), e.get("text", ""))
+            for tag, entries in normalize_texts(texts).items() for e in entries
         ]
         texts = _dedup_texts(prior + list(new_texts))
         _atomic_write_json(os.path.join(cache_run_dir, "texts.json"), texts)
