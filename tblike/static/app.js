@@ -1173,8 +1173,8 @@ async function renderOverlay() {
       const mode = dot ? "markers" : "lines";
       if (smoothOn) {
         traces.push({ x, y: s.values, type: ttype, mode, yaxis,
-          line: { color, width: 0.7, dash }, ...(dot ? { marker: { color, size: 6 } } : {}),
-          opacity: 0.13, hoverinfo: "skip", showlegend: false, name: nm });
+          line: { color, width: 1, dash }, ...(dot ? { marker: { color, size: 6 } } : {}),
+          opacity: 0.32, hoverinfo: "skip", showlegend: false, name: nm });
         traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode, yaxis,
           line: { color, width: 1.5, dash }, ...(dot ? { marker: { color, size: 7 } } : {}),
           name: nm, hovertemplate: "%{y:.5g}<extra></extra>" });
@@ -1448,31 +1448,16 @@ function addGapMarkers(out, s, xaxis, color, ttype) {
   }
 }
 
-function drawCard(card, series) {
-  const tag = card.dataset.tag;
-  card.classList.remove("loading", "pending-card");
-  card.querySelector(".chart-spinner")?.remove();
-  const plotDiv = $("plot-" + cssId(tag));
-  if (plotDiv) plotDiv.style.display = "";
-
-  // Render the tag name as real HTML (selectable/copyable) above the plot, rather
-  // than Plotly's SVG title which can't be selected. Created once per card.
-  let titleEl = card.querySelector(".chart-title");
-  if (!titleEl) {
-    titleEl = document.createElement("div");
-    titleEl.className = "chart-title";
-    card.insertBefore(titleEl, plotDiv || null);
-  }
-  titleEl.textContent = tag;
-  titleEl.title = tag;
-
+// Build the Plotly traces + layout for a series set under the current view
+// options. Shared by the grid cards and the full-screen expand modal, so both
+// render identically. `opts` tunes chrome that differs between the two (margins,
+// legend cap, font sizes). Returns { traces, layout, ttype }.
+function buildCardFigure(series, opts = {}) {
   const view = stepLimited(series);
   const xaxis = optXaxis(), logy = optLogy(), smoothOn = optSmoothOn(), weight = optWeight();
   // SVG by default (no WebGL context — immune to context exhaustion / broken
   // tiles); escalate to WebGL only for point-heavy cards where SVG would drag.
   const ttype = seriesPointTotal(series, smoothOn) > GL_POINT_THRESHOLD ? "scattergl" : "scatter";
-  const cs = state.cards.get(tag);
-  if (cs) cs.glWanted = ttype === "scattergl";
   const traces = [];
   const gapTraces = [];   // appended last so the markers sit on top of every line
   for (const s of view) {
@@ -1483,8 +1468,8 @@ function drawCard(card, series) {
     const mode = dot ? "markers" : "lines";
     if (smoothOn) {
       traces.push({ x, y: s.values, type: ttype, mode,
-        line: { color, width: 0.7 }, ...(dot ? { marker: { color, size: 6 } } : {}),
-        opacity: 0.13, hoverinfo: "skip", showlegend: false, name: s.display_name });
+        line: { color, width: 1 }, ...(dot ? { marker: { color, size: 6 } } : {}),
+        opacity: 0.32, hoverinfo: "skip", showlegend: false, name: s.display_name });
       traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode,
         line: { color, width: 1.5 }, ...(dot ? { marker: { color, size: 7 } } : {}),
         name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
@@ -1506,27 +1491,142 @@ function drawCard(card, series) {
   const xAxisObj = { title: xaxis === "wall_time" ? "min" : "step", gridcolor: "#2a313c", zeroline: false };
   if (win && xaxis === "step") { xAxisObj.range = win; xAxisObj.autorange = false; }
 
+  const fontSize = opts.fontSize || 10;
   const layout = {
     // Title is rendered as HTML (.chart-title) above the plot so it's selectable;
     // no Plotly SVG title here, so the top margin can be tight.
-    margin: { l: 48, r: 10, t: 8, b: 32 },
+    margin: opts.margin || { l: 48, r: 10, t: 8, b: 32 },
     paper_bgcolor: "#161b22", plot_bgcolor: "#161b22",
-    font: { color: "#d7dde5", size: 10 },
+    font: { color: "#d7dde5", size: fontSize },
     xaxis: xAxisObj,
     yaxis,
-    showlegend: view.length <= 12,
-    legend: { font: { size: 9 }, orientation: "h", y: -0.2 },
+    showlegend: view.length <= (opts.legendCap ?? 12),
+    legend: { font: { size: opts.legendFontSize || 9 }, orientation: "h", y: opts.legendY ?? -0.2 },
     // "x unified" lists every series at the hovered step (overlapping lines included)
     hovermode: "x unified",
-    hoverlabel: { namelength: 32, font: { size: 10 }, bgcolor: "#0f1419" },
+    hoverlabel: { namelength: 32, font: { size: fontSize }, bgcolor: "#0f1419" },
     // uirevision preserves the user's zoom/pan across re-renders, but is bumped
     // when an axis-defining option changes so new ranges/clip actually apply.
     uirevision: `${xaxis}|${logy}|${optOutliers() ? optQLow() + "-" + optQHigh() : "noclip"}` +
       `|${win ? win[0] + "-" + win[1] : "fullstep"}`,
   };
+  return { traces, layout, ttype };
+}
+
+function drawCard(card, series) {
+  const tag = card.dataset.tag;
+  card.classList.remove("loading", "pending-card");
+  card.querySelector(".chart-spinner")?.remove();
+  const plotDiv = $("plot-" + cssId(tag));
+  if (plotDiv) plotDiv.style.display = "";
+
+  // Render the tag name as real HTML (selectable/copyable) above the plot, rather
+  // than Plotly's SVG title which can't be selected. Created once per card.
+  let titleEl = card.querySelector(".chart-title");
+  if (!titleEl) {
+    titleEl = document.createElement("div");
+    titleEl.className = "chart-title";
+    card.insertBefore(titleEl, plotDiv || null);
+  }
+  titleEl.textContent = tag;
+  titleEl.title = tag;
+
+  // Expand-to-fullscreen button (top-right). Created once per card; opens a large
+  // modal for this tag with more points fetched for the detailed view.
+  if (!card.querySelector(".chart-expand")) {
+    const exp = document.createElement("button");
+    exp.className = "chart-expand";
+    exp.title = "Expand this graph (full screen, more points)";
+    exp.textContent = "⤢";
+    exp.onclick = (e) => { e.stopPropagation(); openChartModal(tag); };
+    card.appendChild(exp);
+  }
+
+  const { traces, layout, ttype } = buildCardFigure(series);
+  const cs = state.cards.get(tag);
+  if (cs) cs.glWanted = ttype === "scattergl";
   Plotly.react("plot-" + cssId(tag), traces, layout, { responsive: true, displaylogo: false });
   if (cs) cs.drawn = true;
   state.live.add(tag);   // renderOnscreen owns eviction; this just records the drawn plot
+}
+
+// ---- full-screen "expand one graph" modal ----------------------------------
+// Opens a single tag near-full-screen with a higher point budget than the grid
+// cards, so you can inspect one chart in detail. Style options (smoothing, log-y,
+// step window, x-axis, outlier clip) stay live: toggling them redraws the modal.
+let _modalTag = null;      // tag currently shown in the modal (null = closed)
+let _modalSeries = null;   // its hi-res series (redrawn on style-only changes)
+let _modalToken = 0;       // cancels a superseded async fetch
+
+// Hi-res point budget for the expanded view: several × the grid setting, capped
+// well under the server's 100k limit so a single detailed chart stays responsive.
+const hiResPoints = () => Math.min(50000, Math.max(optMaxPoints() * 8, 8000));
+
+function ensureChartModal() {
+  let modal = $("chartmodal");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "chartmodal";
+  modal.className = "chartmodal";
+  modal.innerHTML =
+    `<div class="cm-box">` +
+      `<div class="cm-head">` +
+        `<span class="cm-title"></span>` +
+        `<span class="cm-note"></span>` +
+        `<button class="cm-close" title="Close (Esc)">✕</button>` +
+      `</div>` +
+      `<div class="cm-plot" id="chartmodalplot"></div>` +
+    `</div>`;
+  document.body.appendChild(modal);
+  const close = () => closeChartModal();
+  modal.addEventListener("mousedown", (e) => { if (e.target === modal) close(); });  // backdrop
+  modal.querySelector(".cm-close").onclick = close;
+  return modal;
+}
+
+function closeChartModal() {
+  const modal = $("chartmodal");
+  if (!modal) return;
+  _modalTag = null; _modalSeries = null; _modalToken++;
+  const plotEl = $("chartmodalplot");
+  if (plotEl && plotEl._fullLayout) { try { Plotly.purge(plotEl); } catch {} }
+  modal.classList.remove("show");
+}
+
+async function openChartModal(tag) {
+  const modal = ensureChartModal();
+  _modalTag = tag;
+  modal.classList.add("show");
+  modal.querySelector(".cm-title").textContent = tag;
+  modal.querySelector(".cm-title").title = tag;
+  const note = modal.querySelector(".cm-note");
+  note.textContent = "loading…";
+  const token = ++_modalToken;
+  const points = hiResPoints();
+  try {
+    const resp = await fetch("api/series", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_ids: [...state.selectedRuns], tags: [tag], max_points: points }),
+    }).then((x) => x.json());
+    if (token !== _modalToken) return;   // superseded (reopened / closed)
+    _modalSeries = resp.series || [];
+    note.textContent = _modalSeries.length ? `up to ${points.toLocaleString()} pts/series` : "no data";
+    drawModal();
+  } catch (e) {
+    if (token !== _modalToken) return;
+    note.textContent = "failed to load";
+  }
+}
+
+function drawModal() {
+  if (!_modalTag || !_modalSeries) return;
+  const plotEl = $("chartmodalplot");
+  if (!plotEl) return;
+  const { traces, layout } = buildCardFigure(_modalSeries, {
+    margin: { l: 64, r: 24, t: 10, b: 48 },
+    fontSize: 12, legendCap: 24, legendFontSize: 11, legendY: -0.14,
+  });
+  Plotly.react("chartmodalplot", traces, layout, { responsive: true, displaylogo: false });
 }
 
 // ---- "scroll to new charts" pill -------------------------------------------
@@ -1701,6 +1801,26 @@ async function applySelection(payload) {
   idle(`restored selection: ${payload.name || "shared"}`);
 }
 
+// Default name for a share link: <short hash>-<dd>-<mm>-<yyyy>. The hash is a
+// short, stable digest of the selection payload (same runs+tags+view → same hash),
+// so the auto-name is meaningful and one click creates a link without typing.
+function hashPayload(obj) {
+  const str = JSON.stringify(obj);
+  let h = 0x811c9dc5;   // FNV-1a
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36).padStart(6, "0").slice(0, 6);
+}
+function defaultShareName(payload) {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${hashPayload(payload)}-${dd}-${mm}-${yyyy}`;
+}
+
 // Inline dialog instead of prompt()/clipboard — both are unreliable on mobile
 // (prompt is blocked in several mobile browsers; navigator.clipboard is absent on
 // non-HTTPS origins like http://<server-ip>:<port>). The link is shown in a
@@ -1748,7 +1868,10 @@ function shareSelection() {
   $("share-cancel").onclick = close;
   $("share-done").onclick = close;
   const nameInput = $("share-name");
-  setTimeout(() => nameInput.focus(), 0);
+  // Pre-fill an auto-generated default so a link can be created in one click;
+  // it's selected on focus so typing replaces it if the user wants their own name.
+  nameInput.value = defaultShareName(selectionPayload());
+  setTimeout(() => { nameInput.focus(); nameInput.select(); }, 0);
 
   const create = async () => {
     const name = nameInput.value.trim();
@@ -1802,6 +1925,7 @@ function redrawVisible() {
   };
   step();
   renderOverlay();   // the overlay shares the same style options (logy, step window, x-axis)
+  drawModal();       // the expand modal shares them too (redraw from its hi-res cache)
 }
 
 // Invalidate cached series (refetch-affecting change) and reload via the queue.
@@ -1811,6 +1935,7 @@ function reloadVisible() {
   pump();
   renderOnscreen();   // drop now-stale plots; fresh ones redraw as fetches land
   renderOverlay();
+  if (_modalTag) openChartModal(_modalTag);   // re-fetch the expanded chart (runs/points/x-axis changed)
 }
 
 const scheduleGrid = debounce(renderGrid, 150);
@@ -1969,6 +2094,11 @@ for (const id of ["max-points", "xaxis"]) {
 
 $("refresh-btn").onclick = refreshSelected;
 $("share-btn").onclick = shareSelection;
+
+// Esc closes the full-screen chart modal.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && _modalTag) closeChartModal();
+});
 
 trackScroll(chartsEl());
 trackScroll(window);

@@ -201,15 +201,56 @@ main {
 }
 /* Fixed height so a placeholder and the rendered plot occupy the exact same box
    (no layout jitter when a chart draws, or when one is purged back to a placeholder). */
-.chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+.chart { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
          padding: 6px; height: 312px; box-sizing: border-box; }
 .chart .plot { width: 100%; height: 282px; }
+/* Expand-to-fullscreen button, bottom-right of a drawn card. Kept clear of
+   Plotly's top-right modebar (autoscale etc.). Neutral grey by default, brightens
+   to white on hover so it reads as a distinct app control rather than a chart tool. */
+.chart-expand {
+  position: absolute; bottom: 6px; right: 6px; z-index: 5;
+  width: 22px; height: 22px; padding: 0; line-height: 1; font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--panel2); color: var(--muted);
+  border: 1px solid var(--muted); border-radius: 6px; cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  opacity: .55; transition: opacity .12s, background .12s, color .12s, border-color .12s, transform .1s;
+}
+.chart:hover .chart-expand { opacity: 1; }
+.chart-expand:hover { background: #f2f4f7; color: #06121f; border-color: #f2f4f7; transform: translateY(-1px); }
 /* Selectable/copyable tag title (replaces Plotly's non-selectable SVG title). */
 .chart-title {
   height: 18px; line-height: 16px; padding: 0 2px 2px; font-size: 12px; font-weight: 600;
   color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   user-select: text; cursor: text;
 }
+
+/* full-screen "expand one graph" modal */
+.chartmodal {
+  position: fixed; inset: 0; z-index: 260; background: rgba(0,0,0,.6);
+  display: none; align-items: center; justify-content: center; padding: 2.5vh 2.5vw;
+}
+.chartmodal.show { display: flex; }
+.cm-box {
+  display: flex; flex-direction: column;
+  width: 95vw; height: 95vh;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 16px 60px rgba(0,0,0,.6); padding: 10px 12px;
+}
+.cm-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.cm-title {
+  font-size: 14px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text; cursor: text;
+}
+.cm-note { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.cm-close {
+  margin-left: auto; flex: 0 0 auto; width: 28px; height: 28px; padding: 0;
+  display: flex; align-items: center; justify-content: center; font-size: 15px;
+  background: var(--panel2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+}
+.cm-close:hover { color: var(--accent); border-color: var(--accent); }
+.cm-plot { flex: 1; min-height: 0; width: 100%; }
 
 /* Floating "jump to the top of the current group" button — appears only once
    you've scrolled past a group's header, so you can get back to it (and its
