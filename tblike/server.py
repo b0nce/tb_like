@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -38,9 +39,29 @@ class SelectionRequest(BaseModel):
     overlay: dict = {}
 
 
+class ColorsRequest(BaseModel):
+    colors: dict[str, str] = {}
+
+
 def _slugify(name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     return s[:80] or "selection"
+
+
+# Guards read-modify-write of the shared cache/_colors.json map.
+_COLORS_LOCK = threading.Lock()
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def _read_colors(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def create_app(
@@ -161,6 +182,25 @@ def create_app(
                 return json.load(fh)
         except (OSError, json.JSONDecodeError):
             raise HTTPException(500, "selection unreadable")
+
+    @app.get("/api/colors")
+    def get_colors():
+        # Per-run color assignments, persisted so a run keeps its color across
+        # restarts (and new runs never shift the colors of existing ones).
+        return {"colors": _read_colors(os.path.join(app.state.cache_dir, "_colors.json"))}
+
+    @app.post("/api/colors")
+    def post_colors(req: ColorsRequest):
+        # Merge the given {run_id: "#rrggbb"} updates into the stored map. Invalid
+        # (non-hex) values are dropped rather than persisted.
+        updates = {k: v for k, v in req.colors.items() if isinstance(v, str) and _HEX_RE.match(v)}
+        path = os.path.join(app.state.cache_dir, "_colors.json")
+        with _COLORS_LOCK:
+            current = _read_colors(path)
+            current.update(updates)
+            os.makedirs(app.state.cache_dir, exist_ok=True)
+            _atomic_write_json(path, current)
+        return {"saved": len(updates)}
 
     @app.get("/api/status")
     def get_status():

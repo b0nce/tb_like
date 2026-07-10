@@ -34,9 +34,94 @@ const PALETTE = [
 
 function colorFor(runId) {
   if (!state.runColor.has(runId)) {
-    state.runColor.set(runId, PALETTE[state.runColor.size % PALETTE.length]);
+    const c = PALETTE[state.runColor.size % PALETTE.length];
+    state.runColor.set(runId, c);
+    persistColor(runId, c);   // remember auto-assignments so they never shift later
   }
   return state.runColor.get(runId);
+}
+
+// Colors are cached on disk (cache/_colors.json) so a run keeps its color across
+// runs, and new runs never renumber the colors of existing ones. Writes are
+// batched: we accumulate {run_id: color} and flush shortly after.
+const _colorQueue = new Map();
+let _flushColors = null;   // lazily built (debounce is declared further below)
+function persistColor(runId, color) {
+  _colorQueue.set(runId, color);
+  if (!_flushColors) _flushColors = debounce(() => {
+    if (!_colorQueue.size) return;
+    const colors = Object.fromEntries(_colorQueue);
+    _colorQueue.clear();
+    fetch("api/colors", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ colors }),
+    }).catch(() => {});
+  }, 400);
+  _flushColors();
+}
+
+async function loadColors() {
+  try {
+    const r = await fetch("api/colors").then((x) => x.ok ? x.json() : null);
+    if (r && r.colors) for (const [rid, c] of Object.entries(r.colors)) state.runColor.set(rid, c);
+  } catch { /* colors are best-effort; fall back to palette assignment */ }
+}
+
+// Set a run's color explicitly (from the picker), persist it, and repaint.
+function setRunColor(runId, color) {
+  state.runColor.set(runId, color);
+  persistColor(runId, color);
+  renderRunList();
+  redrawVisible();
+}
+
+// ---- color picker (swatch click) ------------------------------------------
+let _cpick = null;
+function closeColorPicker() {
+  if (!_cpick) return;
+  _cpick.remove();
+  _cpick = null;
+  document.removeEventListener("mousedown", _cpickOutside, true);
+}
+function _cpickOutside(e) { if (_cpick && !_cpick.contains(e.target)) closeColorPicker(); }
+
+function openColorPicker(runId, anchor) {
+  if (_cpick && _cpick.dataset.run === runId) { closeColorPicker(); return; }
+  closeColorPicker();
+  const cur = colorFor(runId);
+  const pop = document.createElement("div");
+  pop.className = "cpick";
+  pop.dataset.run = runId;
+
+  const grid = document.createElement("div");
+  grid.className = "cpick-grid";
+  for (const c of PALETTE) {
+    const b = document.createElement("button");
+    b.className = "cpick-sw" + (c.toLowerCase() === cur.toLowerCase() ? " sel" : "");
+    b.style.background = c;
+    b.title = c;
+    b.onclick = () => { setRunColor(runId, c); closeColorPicker(); };
+    grid.appendChild(b);
+  }
+
+  const custom = document.createElement("label");
+  custom.className = "cpick-custom";
+  const inp = document.createElement("input");
+  inp.type = "color";
+  inp.value = /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : "#4c9aff";
+  inp.oninput = () => { state.runColor.set(runId, inp.value); anchor.style.background = inp.value; };
+  inp.onchange = () => setRunColor(runId, inp.value);   // commit + persist once
+  custom.append(inp, document.createTextNode("Custom"));
+
+  pop.append(grid, custom);
+  document.body.appendChild(pop);
+
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)) + "px";
+  pop.style.top = Math.min(r.bottom + 4, window.innerHeight - pop.offsetHeight - 8) + "px";
+  _cpick = pop;
+  // Defer so the click that opened it doesn't immediately close it.
+  setTimeout(() => document.addEventListener("mousedown", _cpickOutside, true), 0);
 }
 
 const $ = (id) => document.getElementById(id);
@@ -176,6 +261,13 @@ function renderRunList() {
     const sw = document.createElement("span");
     sw.className = "swatch";
     sw.style.background = colorFor(run.run_id);
+    sw.title = "Click to change color";
+    sw.onclick = (e) => {
+      // Inside the <label>, a plain click would toggle the checkbox — intercept it.
+      e.preventDefault();
+      e.stopPropagation();
+      openColorPicker(run.run_id, sw);
+    };
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = run.display_name;
@@ -2115,6 +2207,7 @@ renderGrid();
     try { _pendingSel = await fetch("api/selections/" + encodeURIComponent(sel)).then((x) => x.ok ? x.json() : null); }
     catch { _pendingSel = null; }
   }
+  await loadColors();   // seed persisted colors before the first run-list render
   loadRuns();
   loadStatus();
   setInterval(loadStatus, 3000);
