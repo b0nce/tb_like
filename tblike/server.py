@@ -70,6 +70,7 @@ def create_app(
     watch: bool = True,
     interval: float = 10.0,
     jobs: int = 1,
+    hover_legend: bool = False,
 ) -> FastAPI:
     store = Store(cache_dir)
     watcher = Watcher(runs_dir, cache_dir, interval=interval, jobs=jobs)
@@ -89,6 +90,11 @@ def create_app(
     app.state.watcher = watcher
     app.state.runs_dir = os.path.abspath(runs_dir)
     app.state.cache_dir = os.path.abspath(cache_dir)
+
+    @app.get("/api/config")
+    def get_config():
+        # Launch-time UI defaults (the dashboard reads these once, at boot).
+        return {"hover_legend": hover_legend}
 
     @app.get("/api/runs")
     def get_runs():
@@ -226,4 +232,5 @@ app = create_app(
     watch=os.environ.get("TBLIKE_WATCH", "1") != "0",
     interval=float(os.environ.get("TBLIKE_INTERVAL", "10")),
     jobs=int(os.environ.get("TBLIKE_JOBS", "1")),
+    hover_legend=os.environ.get("TBLIKE_HOVER_LEGEND", "0") == "1",
 )

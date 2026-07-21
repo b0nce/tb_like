@@ -209,6 +209,24 @@ async function loadTags(force = false) {
   }
 }
 
+// Which server this page came from. Taken from the URL rather than the launch
+// flags, so it stays right behind a proxy / notebook sub-path too.
+function showPort() {
+  const el = $("portbadge");
+  if (!el) return;
+  const port = location.port || (location.protocol === "https:" ? "443" : "80");
+  el.textContent = `${location.hostname}:${port}`;
+  el.title = `served from ${location.origin}`;
+}
+
+// Launch-time defaults from the CLI flags (read once, before the first render).
+async function loadConfig() {
+  try {
+    const c = await fetch("api/config").then((x) => x.json());
+    if (c.hover_legend) $("hover-legend").checked = true;
+  } catch {}
+}
+
 let _prevReady = -1;
 async function loadStatus() {
   let s;
@@ -220,8 +238,10 @@ async function loadStatus() {
     srcEl.textContent = "src: " + s.runs_dir;
     srcEl.title = s.runs_dir;
     // Tab title = the source folder's last-level name (not the full path).
+    // Tab title carries the port too, so tabs for different servers are easy to tell apart.
     const leaf = s.runs_dir.replace(/[/\\]+$/, "").split(/[/\\]/).pop();
-    document.title = leaf ? `tb_like: ${leaf}` : "tb_like";
+    const port = location.port ? `:${location.port}` : "";
+    document.title = (leaf ? `tb_like: ${leaf}` : "tb_like") + port;
   }
   const p = s.progress || {};
   const processing = !!p.converting || (p.pending || 0) > 0;
@@ -728,6 +748,9 @@ const optWeight = () => parseFloat($("smooth").value);
 const optOutliers = () => $("outliers-on").checked;
 const optQLow = () => parseFloat($("q-low").value);
 const optQHigh = () => parseFloat($("q-high").value);
+// Legend off → each run is named inside the unified hover tooltip instead. Frees
+// the strip the legend occupied and stays readable past the legend cap.
+const optHoverLegend = () => $("hover-legend").checked;
 
 // ---- global step range (limits every chart to a step window, client-side) --
 const _human = (n) => {
@@ -1300,7 +1323,9 @@ async function renderOverlay() {
     yaxis2: yB,
     showlegend: false,
     hovermode: "x unified",
-    hoverlabel: { namelength: 40, font: { size: 10 }, bgcolor: "#0f1419" },
+    // -1 = no cutoff: hover anywhere in the plot, not just near a curve.
+    hoverdistance: -1, spikedistance: -1,
+    hoverlabel: { namelength: 40, font: { size: 10 }, bgcolor: "rgba(15,20,25,0.78)" },
   };
   plotEl.style.display = "";
   Plotly.react("overlayplot", traces, layout, { responsive: true, displaylogo: false });
@@ -1540,6 +1565,16 @@ function addGapMarkers(out, s, xaxis, color, ttype) {
   }
 }
 
+// Run names in the hover tooltip decide how wide the box is, and these names run
+// 60+ chars with a long shared prefix. Ellipsize the MIDDLE: the head and the
+// tail are what actually differ between runs (…-Seed_2048-V1), so this keeps the
+// box narrow without losing the part you're reading it for.
+function shortRunName(name, max = 30) {
+  if (name.length <= max) return name;
+  const head = Math.ceil((max - 1) / 2), tail = max - 1 - head;
+  return name.slice(0, head) + "…" + name.slice(name.length - tail);
+}
+
 // Build the Plotly traces + layout for a series set under the current view
 // options. Shared by the grid cards and the full-screen expand modal, so both
 // render identically. `opts` tunes chrome that differs between the two (margins,
@@ -1550,6 +1585,13 @@ function buildCardFigure(series, opts = {}) {
   // SVG by default (no WebGL context — immune to context exhaustion / broken
   // tiles); escalate to WebGL only for point-heavy cards where SVG would drag.
   const ttype = seriesPointTotal(series, smoothOn) > GL_POINT_THRESHOLD ? "scattergl" : "scatter";
+  // In "x unified" mode the <extra> block is each row's label: empty means the row
+  // shows only the value (the legend names the runs), filled puts the run name in
+  // the tooltip itself — which is what hover-legend mode trades the legend for.
+  const hoverLegend = optHoverLegend();
+  const hoverTpl = (name) =>
+    hoverLegend ? `%{y:.5g}<extra>${esc(shortRunName(name, opts.hoverNameLen ?? 30))}</extra>`
+                : "%{y:.5g}<extra></extra>";
   const traces = [];
   const gapTraces = [];   // appended last so the markers sit on top of every line
   for (const s of view) {
@@ -1564,11 +1606,11 @@ function buildCardFigure(series, opts = {}) {
         opacity: 0.32, hoverinfo: "skip", showlegend: false, name: s.display_name });
       traces.push({ x, y: smoothValues(s.values, weight), type: ttype, mode,
         line: { color, width: 1.5 }, ...(dot ? { marker: { color, size: 7 } } : {}),
-        name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+        name: s.display_name, hovertemplate: hoverTpl(s.display_name) });
     } else {
       traces.push({ x, y: s.values, type: ttype, mode,
         line: { color, width: 1.4 }, ...(dot ? { marker: { color, size: 7 } } : {}),
-        name: s.display_name, hovertemplate: "%{y:.5g}<extra></extra>" });
+        name: s.display_name, hovertemplate: hoverTpl(s.display_name) });
     }
     if (s.gaps && s.gaps.length) addGapMarkers(gapTraces, s, xaxis, color, ttype);
   }
@@ -1592,11 +1634,18 @@ function buildCardFigure(series, opts = {}) {
     font: { color: "#d7dde5", size: fontSize },
     xaxis: xAxisObj,
     yaxis,
-    showlegend: view.length <= (opts.legendCap ?? 12),
+    showlegend: !hoverLegend && view.length <= (opts.legendCap ?? 12),
     legend: { font: { size: opts.legendFontSize || 9 }, orientation: "h", y: opts.legendY ?? -0.2 },
     // "x unified" lists every series at the hovered step (overlapping lines included)
     hovermode: "x unified",
-    hoverlabel: { namelength: 32, font: { size: fontSize }, bgcolor: "#0f1419" },
+    // Plotly only fires hover within ~20px of a point by default, so most of a
+    // card (anywhere far above/below the curves) is dead space. -1 removes the
+    // cutoff entirely: the tooltip follows the cursor across the whole plot —
+    // which matters most in hover-legend mode, where hover IS the legend.
+    hoverdistance: -1, spikedistance: -1,
+    // Translucent: the tooltip always lands on top of some part of the curve, so
+    // let the data read through it rather than punch a hole in the plot.
+    hoverlabel: { namelength: 32, font: { size: fontSize }, bgcolor: "rgba(15,20,25,0.78)" },
     // uirevision preserves the user's zoom/pan across re-renders, but is bumped
     // when an axis-defining option changes so new ranges/clip actually apply.
     uirevision: `${xaxis}|${logy}|${optOutliers() ? optQLow() + "-" + optQHigh() : "noclip"}` +
@@ -1717,6 +1766,7 @@ function drawModal() {
   const { traces, layout } = buildCardFigure(_modalSeries, {
     margin: { l: 64, r: 24, t: 10, b: 48 },
     fontSize: 12, legendCap: 24, legendFontSize: 11, legendY: -0.14,
+    hoverNameLen: 52,   // full-screen: room for more of the run name
   });
   Plotly.react("chartmodalplot", traces, layout, { responsive: true, displaylogo: false });
 }
@@ -1840,6 +1890,7 @@ function selectionPayload() {
       maxPoints: optMaxPoints(), xaxis: optXaxis(),
       smoothOn: optSmoothOn(), weight: optWeight(), logy: optLogy(),
       outliers: optOutliers(), qLow: optQLow(), qHigh: optQHigh(),
+      hoverLegend: optHoverLegend(),
       stepLo: state.stepRange.lo, stepHi: state.stepRange.hi,
     },
     overlay: {
@@ -1862,6 +1913,7 @@ async function applySelection(payload) {
   if (v.outliers != null) $("outliers-on").checked = !!v.outliers;
   if (v.qLow != null) $("q-low").value = v.qLow;
   if (v.qHigh != null) $("q-high").value = v.qHigh;
+  if (v.hoverLegend != null) $("hover-legend").checked = !!v.hoverLegend;
   updateQReadout();
   // Runs/tags may have changed since the link was made — apply the intersection.
   const haveRuns = new Set(state.runs.map((r) => r.run_id));
@@ -2103,7 +2155,7 @@ function updateQReadout() {
   $("smooth-val").firstElementChild.textContent = optWeight().toFixed(2);
 }
 const styleDebounced = debounce(() => { updateQReadout(); redrawVisible(); }, 120);
-for (const id of ["logy", "smooth-on", "smooth", "outliers-on", "q-low", "q-high"]) {
+for (const id of ["logy", "smooth-on", "smooth", "outliers-on", "q-low", "q-high", "hover-legend"]) {
   $(id).oninput = styleDebounced;
   $(id).onchange = styleDebounced;
 }
@@ -2202,6 +2254,8 @@ renderGrid();
 // loads runs (loadRuns applies it; loadStatus can also trigger loadRuns), so the
 // pending selection is always set first; otherwise just load runs normally.
 (async function boot() {
+  showPort();
+  await loadConfig();   // launch-flag UI defaults; a ?sel= link may override them
   const sel = new URLSearchParams(location.search).get("sel");
   if (sel) {
     try { _pendingSel = await fetch("api/selections/" + encodeURIComponent(sel)).then((x) => x.ok ? x.json() : null); }

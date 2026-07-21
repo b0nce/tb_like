@@ -30,6 +30,14 @@ header h1 { margin: 0; font-size: 18px; color: var(--accent); }
   max-width: 46vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   user-select: text; cursor: text;
 }
+/* Which server this tab is talking to — several tblike instances often run at once. */
+.portbadge {
+  color: var(--muted); font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 5px; padding: 1px 6px; white-space: nowrap;
+  user-select: text; cursor: text;
+}
 .status { margin-left: auto; color: var(--muted); font-size: 12px; }
 .refresh-btn {
   background: var(--panel2); color: var(--text); border: 1px solid var(--border);

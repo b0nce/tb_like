@@ -29,6 +29,7 @@
   <header>
     <h1>tb_like</h1>
     <span class="srcpath" id="srcpath" title="source folder this server was launched against"></span>
+    <span class="portbadge" id="portbadge" title="host:port this dashboard is served from"></span>
     <span class="status" id="status">starting…</span>
     <button id="share-btn" class="refresh-btn" title="Save the current runs, tags & view as a shareable link">⤴ Share selection</button>
     <button id="refresh-btn" class="refresh-btn" title="Re-read selected runs from disk (pick up new events)">↻ Refresh selected</button>
@@ -76,6 +77,7 @@
         <label class="chk"><input type="checkbox" id="smooth-on" /> smoothing <span id="smooth-val" class="qhead" style="margin-left:auto"><span>0.60</span></span></label>
         <input type="range" id="smooth" min="0" max="0.99" step="0.01" value="0.6" />
         <label class="chk"><input type="checkbox" id="logy" /> log y</label>
+        <label class="chk" title="Hide the per-chart legend and name each run in the hover tooltip instead — more plot area, easier to read with many runs"><input type="checkbox" id="hover-legend" /> run names on hover (no legend)</label>
         <label class="chk"><input type="checkbox" id="outliers-on" /> clip outliers (percentile)</label>
         <div class="qgrid">
           <div class="qcol">

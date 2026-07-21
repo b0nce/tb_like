@@ -168,6 +168,9 @@ def run_serve(argv: list[str]) -> None:
                    help=f"parallel parse workers for background conversion (default: {DEFAULT_JOBS})")
     p.add_argument("--interval", type=float, default=10.0, help="watcher poll interval, seconds")
     p.add_argument("--no-watch", action="store_true", help="serve only; do not ingest in the background")
+    p.add_argument("--hover-legend", action="store_true",
+                   help="start with per-chart legends off; run names appear in the hover tooltip "
+                        "instead (more plot area — handy with many runs). Toggleable in the UI.")
     args = p.parse_args(argv)
 
     if not os.path.isdir(args.runs_dir):
@@ -178,6 +181,7 @@ def run_serve(argv: list[str]) -> None:
     os.environ["TBLIKE_WATCH"] = "0" if args.no_watch else "1"
     os.environ["TBLIKE_INTERVAL"] = str(args.interval)
     os.environ["TBLIKE_JOBS"] = str(args.jobs)
+    os.environ["TBLIKE_HOVER_LEGEND"] = "1" if args.hover_legend else "0"
     print(f"tb_like → http://{args.host}:{args.port}   runs={args.runs_dir}  cache={cache}")
     uvicorn.run("tblike.server:app", host=args.host, port=args.port, reload=False)
 

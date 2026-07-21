@@ -59,6 +59,10 @@ the cache in sync, and serves them — no separate build step. The cache lives i
   (`…expert_idx_∗`), and layer indices kept as their own levels.
 - Multi-run overlay, unified hover, EMA smoothing, log-y, step vs. relative-time
   x-axis, and **outlier clipping** by value percentiles.
+- **Hover-legend mode** (`--hover-legend`, or the "run names on hover" checkbox):
+  drops the per-chart legend and names each run inside the unified hover tooltip
+  instead — more plot area per card, and run names stay available past the point
+  where a legend gets too crowded to be useful.
 - Collapsible per-group chart sections, resizable sidebar, and a one-click
   **Refresh selected** that re-ingests from disk and rebuilds the plots.
 - **Text diff** panel (pinned at the bottom): compare logged text summaries —
@@ -74,6 +78,7 @@ the cache in sync, and serves them — no separate build step. The cache lives i
 
 ```
 tblike <runs_dir> [--port P] [--host H] [--cache-dir D] [-j JOBS] [--no-watch]
+                  [--hover-legend]
                                             # the main command: serve + auto-ingest
 ```
 
