@@ -16,7 +16,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from .convert import _atomic_write_json, backfill_texts, convert_run
 from .store import Store
-from .watcher import Watcher
+from .watcher import Watcher, run_dir_for
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -140,8 +140,8 @@ def create_app(
         # new tfevents). Sync endpoint -> runs in the threadpool, off the loop.
         refreshed, new_rows, text_added = [], 0, 0
         for rid in req.run_ids:
-            run_dir = os.path.join(runs_dir, rid)
-            if not os.path.isdir(run_dir):
+            run_dir = run_dir_for(runs_dir, rid)
+            if run_dir is None:
                 continue
             cache_run_dir = os.path.join(cache_dir, rid)
             try:

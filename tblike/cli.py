@@ -159,7 +159,8 @@ def run_serve(argv: list[str]) -> None:
         prog="tblike",
         description="Serve the tb_like dashboard for a folder of runs (auto-ingests in the background).",
     )
-    p.add_argument("runs_dir", help="folder containing run subdirs with events.out.tfevents.* files")
+    p.add_argument("runs_dir", help="folder of run subdirs with events.out.tfevents.* files "
+                                    "(or a single run's folder, served as one run)")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--cache-dir", default=None,

@@ -18,10 +18,19 @@ from .convert import convert_run
 from .events import list_event_files
 
 
+def flat_run_id(runs_dir: str) -> str:
+    """Run id used when the event files sit directly in ``runs_dir``."""
+    return os.path.basename(os.path.abspath(runs_dir)) or "run"
+
+
 def discover_runs(runs_dir: str) -> list[tuple[str, str]]:
     """Return (run_id, run_dir) for every immediate subdir holding event files.
 
     Symlinked run dirs are followed (used by the test harness).
+
+    Flat layout: if no subdir is a run but ``runs_dir`` itself holds event files
+    (someone points tblike straight at a single run's folder), the folder is
+    served as one run named after its basename.
     """
     out = []
     if not os.path.isdir(runs_dir):
@@ -32,7 +41,29 @@ def discover_runs(runs_dir: str) -> list[tuple[str, str]]:
             continue
         if list_event_files(path):
             out.append((name, path))
+    if not out and list_event_files(runs_dir):
+        out.append((flat_run_id(runs_dir), runs_dir))
     return out
+
+
+def run_dir_for(runs_dir: str, run_id: str) -> str | None:
+    """Source directory of ``run_id``, or None if it's not on disk.
+
+    Usually ``<runs_dir>/<run_id>``, except in the flat layout above where the
+    single run *is* ``runs_dir``.
+    """
+    path = os.path.join(runs_dir, run_id)
+    if os.path.isdir(path):
+        return path
+    if run_id != flat_run_id(runs_dir) or not os.path.isdir(runs_dir):
+        return None
+    # Flat layout only: event files sitting directly in runs_dir. Checked on the
+    # top level (not recursively) so a run subdir named like its parent doesn't
+    # resolve the whole runs folder as one run.
+    for name in os.listdir(runs_dir):
+        if name.startswith("events.out.tfevents."):
+            return runs_dir
+    return None
 
 
 def _signature(run_dir: str) -> tuple[int, float]:
